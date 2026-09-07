@@ -19,12 +19,29 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Dict, Optional
 
-from playwright.sync_api import sync_playwright
+# --- Android/Termux port -----------------------------------------------------
+# Playwright's bundled Chromium doesn't run on non-rooted Android/Termux. When
+# running under Termux we instead drive the phone's REAL Chrome over the
+# Chrome DevTools Protocol via ADB (the same legitimate mechanism Playwright
+# itself uses for Android). The Android implementation (auth_android.py)
+# mirrors this module's public API: Session, LoginRequired, get_session, login.
+if hasattr(sys, "getandroidapilevel"):
+    from .auth_android import (  # noqa: F401  (drop-in replacement)
+        CHAT_URL,
+        LoginRequired,
+        Session,
+        SIGNIN_URL,
+        get_session,
+        login,
+    )
+else:
+    from playwright.sync_api import sync_playwright
 
 ROOT = Path(__file__).resolve().parent.parent
 # Override with DEEPSEEK_PROFILE_DIR to reuse an existing signed-in Chrome profile.
@@ -34,7 +51,8 @@ DEFAULT_SESSION_FILE = ROOT / "session" / "session.json"
 CHAT_URL = "https://chat.deepseek.com/"
 SIGNIN_URL = "https://chat.deepseek.com/sign_in"
 
-LAUNCH_ARGS = ["--disable-blink-features=AutomationControlled"]
+if not hasattr(sys, "getandroidapilevel"):
+    LAUNCH_ARGS = ["--disable-blink-features=AutomationControlled"]
 # Token is trusted for this long before we refresh it from the browser again.
 SESSION_MAX_AGE = 6 * 60 * 60  # 6 hours
 
@@ -264,3 +282,18 @@ def get_session(
 if __name__ == "__main__":
     s = login()
     print(f"[auth] captured token {s.token[:10]}... ({len(s.cookies)} cookies)")
+
+
+# --- Android/Termux: re-bind the public API to the CDP implementation ---------
+# The definitions above this point are the upstream Playwright ones; on Android
+# we swap the module-level names so callers (deepseek/__init__, server/api.py,
+# deepseek/client.py) transparently get the CDP-over-ADB implementation.
+if hasattr(sys, "getandroidapilevel"):
+    from . import auth_android as _auth_android
+
+    Session = _auth_android.Session
+    LoginRequired = _auth_android.LoginRequired
+    get_session = _auth_android.get_session
+    login = _auth_android.login
+    _headless_refresh = _auth_android._headless_refresh
+    del _auth_android

@@ -21,6 +21,7 @@ RATE_LIMIT_PER_MINUTE); /healthz is exempt.
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 
@@ -129,7 +130,16 @@ async def chat_completions(req: ChatCompletionRequest):
                 prompt, conversation_id=req.conversation_id,
                 model=model_type, thinking=req.thinking, search=req.search,
             )
-            yield from stream_chunks(req.model, stream)
+            try:
+                yield from stream_chunks(req.model, stream)
+            except Exception as e:
+                # Network switch mid-generation: close the SSE stream with an
+                # error frame so OpenAI-compatible clients (OpenCode) abort
+                # instead of hanging on a half-open connection.
+                err = {"error": {"message": f"DeepSeek stream failed: {e}",
+                                  "type": "upstream_error"}}
+                yield f"data: {json.dumps(err)}\n\n"
+                yield "data: [DONE]\n\n"
 
         return StreamingResponse(gen(), media_type="text/event-stream")
 
@@ -138,7 +148,28 @@ async def chat_completions(req: ChatCompletionRequest):
             client.chat, prompt, req.conversation_id,
             model_type, req.thinking, req.search,
         )
+    except LoginRequired as e:
+        return _error(str(e), status=503, err_type="login_required")
+    except RuntimeError as e:
+        # DeepSeek-level API errors (bad/expired token, WAF block, PoW
+        # rejection). Tell the user what to re-run rather than a bare 500.
+        msg = str(e)
+        if "401" in msg or "403" in msg or "token" in msg.lower() \
+                or "unauthorized" in msg.lower() or "waf" in msg.lower():
+            return _error(
+                "DeepSeek rejected the session (auth/WAF). Run "
+                "`python -m deepseek.auth` in ~/deepseek-api to re-login, "
+                f"then retry. Detail: {msg}",
+                status=503, err_type="login_required",
+            )
+        return _error(f"DeepSeek request failed: {e}")
     except Exception as e:
+        if "timed out" in str(e).lower() or "connect" in str(e).lower():
+            return _error(
+                f"Could not reach chat.deepseek.com (network switch or no "
+                f"internet). Check connectivity and retry. Detail: {type(e).__name__}",
+                status=502, err_type="network_error",
+            )
         return _error(f"DeepSeek request failed: {e}")
 
     return completion_response(req.model, reply.text, prompt, reply.conversation_id)

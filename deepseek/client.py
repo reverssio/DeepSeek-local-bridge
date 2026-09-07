@@ -94,11 +94,26 @@ class DeepSeekClient:
         # The wasmtime Store behind the PoW solver is not reentrant; serialise
         # access so concurrent server requests don't corrupt it.
         self._pow_lock = threading.Lock()
+        # Android note: when the phone switches Wi-Fi <-> mobile data, already
+        # established (pooled, keep-alive) TCP sockets to chat.deepseek.com die
+        # silently -- no FIN/RST arrives, so a request sent on one stalls until
+        # the read timeout. We therefore:
+        #   * keep connections in the pool only briefly (keepalive_expiry),
+        #   * retry a bounded number of times on transport errors --
+        #     httpx's transport retries are safe here: they only retry
+        #     requests whose body was fully sent (POSTs below are JSON with
+        #     idempotent server-side effects, and a replayed request the
+        #     server already processed fails cleanly at the HTTP layer
+        #     rather than being silently lost),
+        #   * use a read timeout short enough to notice a dead stream but
+        #     long enough for normal completion generation (was 300s).
         self._http = httpx.Client(
             base_url=BASE,
             headers=self._base_headers(),
             cookies=self.session.cookies,
-            timeout=httpx.Timeout(120.0, read=300.0),
+            timeout=httpx.Timeout(connect=15.0, read=120.0, write=15.0, pool=15.0),
+            limits=httpx.Limits(max_keepalive_connections=2, keepalive_expiry=15.0),
+            transport=httpx.HTTPTransport(retries=2),
         )
 
     def _base_headers(self) -> dict:
@@ -216,14 +231,36 @@ class _Stream:
         # Only select a model on a new thread; on resume the thread keeps its own.
         if self._model is not None:
             body["model_type"] = self._model
-        # PoW challenges are short-lived, so solve right before the request.
-        headers = {"x-ds-pow-response": self._client._pow_header()}
         meta: dict = {}
-        with self._client._http.stream(
-            "POST", COMPLETION_PATH, json=body, headers=headers
-        ) as resp:
-            resp.raise_for_status()
-            yield from _parse_sse(resp.iter_lines(), meta)
+        # Android/Wi-Fi-switch note: a pooled socket that died mid-flight
+        # (network switched under it) surfaces as a transport error on THIS
+        # request. If nothing was yielded yet, one retry with a fresh PoW
+        # challenge is safe and covers the common "switch happened between
+        # requests / right at request start" case. If bytes were already
+        # emitted, retrying would duplicate output, so we raise instead.
+        yielded_any = False
+        for attempt in range(2):
+            # PoW challenges are short-lived, so solve right before the request.
+            headers = {"x-ds-pow-response": self._client._pow_header()}
+            try:
+                with self._client._http.stream(
+                    "POST", COMPLETION_PATH, json=body, headers=headers
+                ) as resp:
+                    resp.raise_for_status()
+                    for chunk in _parse_sse(resp.iter_lines(), meta):
+                        yielded_any = True
+                        yield chunk
+                break
+            except (httpx.TransportError, httpx.HTTPStatusError) as e:
+                if attempt == 0 and not yielded_any:
+                    continue  # single bounded retry with fresh PoW
+                if yielded_any:
+                    raise RuntimeError(
+                        "DeepSeek stream interrupted mid-response (network "
+                        "switch or upstream drop). Partial output was "
+                        "already delivered; ask again to regenerate."
+                    ) from e
+                raise
         if meta.get("message_id") is not None:
             self._message_id = meta["message_id"]
 
