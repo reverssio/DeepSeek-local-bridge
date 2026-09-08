@@ -30,6 +30,7 @@ import httpx
 
 from .auth import Session, get_session
 from .pow import DeepSeekPow
+from .sse import parse_sse_events
 
 BASE = "https://chat.deepseek.com"
 COMPLETION_PATH = "/api/v0/chat/completion"
@@ -65,6 +66,9 @@ class Reply:
 
     text: str
     conversation_id: str
+    # DeepThink reasoning, kept SEPARATE from the visible answer text
+    # ("" when thinking was disabled for the request).
+    reasoning: str = ""
 
     def __str__(self) -> str:  # so print(reply) shows the text
         return self.text
@@ -137,7 +141,10 @@ class DeepSeekClient:
     def create_chat_session(self) -> str:
         r = self._http.post("/api/v0/chat_session/create", json={})
         r.raise_for_status()
-        return _biz(r.json())["chat_session"]["id"]
+        sid = _biz(r.json())["chat_session"]["id"]
+        # Visible marker so conversation creation is countable in server logs
+        print(f"[deepseek] created chat_session {sid}", flush=True)
+        return sid
 
     def _pow_header(self, target_path: str = COMPLETION_PATH) -> str:
         r = self._http.post(
@@ -191,19 +198,28 @@ class DeepSeekClient:
         thinking: bool = False,
         search: bool = False,
     ) -> Reply:
-        """Return the complete reply (`.text`) plus its `.conversation_id`."""
+        """Return the complete reply (`.text`, `.reasoning`) plus its
+        `.conversation_id`."""
         s = self.stream(prompt, conversation_id=conversation_id,
                         model=model, thinking=thinking, search=search)
-        text = "".join(s)
-        return Reply(text=text, conversation_id=s.conversation_id)
+        text, reasoning = [], []
+        for kind, delta in s.events():
+            if kind == "content":
+                text.append(delta)
+            elif kind == "reasoning":
+                reasoning.append(delta)
+        return Reply(text="".join(text), conversation_id=s.conversation_id,
+                     reasoning="".join(reasoning))
 
     def close(self) -> None:
         self._http.close()
 
 
 class _Stream:
-    """Iterable of reply-text chunks. After it's consumed, `.conversation_id`
-    holds the token for resuming the conversation."""
+    """Streamed reply. Iterate `events()` for typed chunks — ("content", text)
+    or ("reasoning", text) — or iterate the object itself for plain text deltas
+    (backwards compatible). After consumption, `.conversation_id` holds the
+    token for resuming the conversation."""
 
     def __init__(self, client: "DeepSeekClient", prompt: str, session_id: str,
                  parent_id: Optional[int], model: str,
@@ -217,7 +233,7 @@ class _Stream:
         self._search = search
         self._message_id: Optional[int] = None
 
-    def __iter__(self) -> Iterator[str]:
+    def events(self):
         body = {
             "chat_session_id": self._session_id,
             "parent_message_id": self._parent_id,
@@ -247,9 +263,11 @@ class _Stream:
                     "POST", COMPLETION_PATH, json=body, headers=headers
                 ) as resp:
                     resp.raise_for_status()
-                    for chunk in _parse_sse(resp.iter_lines(), meta):
-                        yielded_any = True
-                        yield chunk
+                    for ev in parse_sse_events(resp.iter_lines(), meta):
+                        kind = ev[0]
+                        if kind in ("content", "reasoning"):
+                            yielded_any = True
+                        yield ev
                 break
             except (httpx.TransportError, httpx.HTTPStatusError) as e:
                 if attempt == 0 and not yielded_any:
@@ -264,77 +282,23 @@ class _Stream:
         if meta.get("message_id") is not None:
             self._message_id = meta["message_id"]
 
+    def __iter__(self) -> Iterator[str]:
+        for kind, delta in self.events():
+            if kind == "content":
+                yield delta
+
     @property
     def conversation_id(self) -> str:
         return _encode_cid(self._session_id, self._message_id)
 
 
 def _parse_sse(lines, meta: Optional[dict] = None) -> Iterator[str]:
-    """Turn DeepSeek's SSE completion stream into reply-text deltas.
+    """Backwards-compatible text-only view over the typed event parser.
 
-    The stream sends an initial snapshot frame whose `v` is the full response
-    object (with `fragments[].content`), then a series of append frames:
-      * {"p":"response/fragments/-1/content","o":"APPEND","v":" what"}  (sets path)
-      * {"v":"'s"}                                                       (appends to it)
-    We track the active append path and emit only RESPONSE-fragment text.
-
-    If `meta` is given, the assistant's `message_id` is recorded into it (used to
-    build the resumable conversation_id). The exact field location can vary, so
-    we look in a few plausible spots defensively.
+    Kept because external code (examples/) iterates client.stream() directly.
+    NOTE: this view concatenates reasoning into text only if the caller opts
+    in via the `events()` API — no: text-only yields RESPONSE content alone.
     """
-    active_path: Optional[str] = None
-    emitted_initial = False
-
-    for line in lines:
-        if not line or not line.startswith("data:"):
-            continue
-        payload = line[len("data:"):].strip()
-        if not payload or payload == "[DONE]":
-            continue
-        try:
-            obj = json.loads(payload)
-        except json.JSONDecodeError:
-            continue
-
-        v = obj.get("v")
-
-        # Snapshot frame: full response object.
-        if isinstance(v, dict) and "response" in v:
-            if meta is not None:
-                _capture_message_id(meta, v)
-            for frag in v["response"].get("fragments", []):
-                if frag.get("type") == "RESPONSE" and frag.get("content"):
-                    active_path = "response/fragments/-1/content"
-                    if not emitted_initial:
-                        emitted_initial = True
-                        yield frag["content"]
-            continue
-
-        # Path-setting append frame.
-        if "p" in obj:
-            active_path = obj["p"]
-            if meta is not None and active_path.endswith("message_id") \
-                    and isinstance(v, int):
-                meta["message_id"] = v
-            if obj.get("o") == "APPEND" and isinstance(v, str) \
-                    and active_path.endswith("content"):
-                yield v
-            continue
-
-        # Bare append to the current path.
-        if isinstance(v, str) and active_path and active_path.endswith("content"):
-            yield v
-
-
-def _capture_message_id(meta: dict, snapshot: dict) -> None:
-    """Best-effort: pull the assistant message_id out of a snapshot frame.
-
-    DeepSeek nests the assistant message under `response`; we check there first,
-    then the snapshot root, accepting `message_id` or `id`.
-    """
-    for container in (snapshot.get("response"), snapshot):
-        if isinstance(container, dict):
-            mid = container.get("message_id", container.get("id"))
-            if isinstance(mid, int):
-                meta["message_id"] = mid
-                return
+    for kind, delta in parse_sse_events(lines, meta):
+        if kind == "content":
+            yield delta

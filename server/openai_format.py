@@ -1,8 +1,14 @@
-"""Translate between OpenAI's chat-completions shapes and our DeepSeek client.
+"""Translate between OpenAI's chat-completions shapes and the DeepSeek bridge.
 
-DeepSeek's protocol has no system/role channel — just a single `prompt` string.
-So we flatten the OpenAI `messages` array into one prompt, and wrap DeepSeek's
-text output back into OpenAI response/stream objects.
+DeepSeek's protocol has a single `prompt` string per turn. The bridge:
+
+  - builds prompts (first turn: full history + tool instructions; continuation
+    turns: only the NEW messages — the DeepSeek conversation already holds the
+    earlier ones natively),
+  - wraps the typed upstream events (content / reasoning) back into OpenAI
+    response objects, keeping reasoning in `reasoning_content` (the field
+    DeepSeek's own official API uses for DeepThink output) and tool calls in
+    `tool_calls` / streaming tool-call deltas.
 """
 
 from __future__ import annotations
@@ -13,6 +19,7 @@ import uuid
 from typing import Iterable, List
 
 from .schemas import ChatMessage
+from .tools_bridge import ToolCall, build_tool_instructions, format_tool_result
 
 _ROLE_LABELS = {"system": "System", "user": "User", "assistant": "Assistant"}
 
@@ -31,7 +38,7 @@ def _text_of(content) -> str:
 
 
 def messages_to_prompt(messages: List[ChatMessage]) -> str:
-    """Flatten a chat history into a single prompt DeepSeek can answer.
+    """Flatten a chat history into a single prompt (used for NEW conversations).
 
     A lone user message is sent verbatim. Multi-turn / system-prompted
     conversations are serialised with role labels and a trailing 'Assistant:'
@@ -43,9 +50,95 @@ def messages_to_prompt(messages: List[ChatMessage]) -> str:
     lines = []
     for m in messages:
         label = _ROLE_LABELS.get(m.role, m.role.capitalize())
-        lines.append(f"{label}: {_text_of(m.content)}")
-    lines.append("Assistant:")
+        text = _text_of(m.content)
+        # assistant tool-call echo -> render back into the instructed markup so
+        # the model sees its own request shape
+        if m.role == "assistant" and m.tool_calls:
+            for tc in m.tool_calls:
+                fn = tc.get("function", {})
+                try:
+                    args = json.loads(fn.get("arguments") or "{}")
+                except json.JSONDecodeError:
+                    args = {"input": fn.get("arguments")}
+                lines.append(f"Assistant: <tool>{{\"name\": {json.dumps(fn.get('name'))}, "
+                             f"\"arguments\": {json.dumps(args, ensure_ascii=False)}}}</tool>")
+            if text:
+                lines.append(f"Assistant: {text}")
+            continue
+        if m.role == "tool":
+            lines.append(f"User: {format_tool_result(m.name or 'tool', text)}")
+            continue
+        lines.append(f"{label}: {text}")
+    if messages and messages[-1].role != "assistant":
+        lines.append("Assistant:")
     return "\n\n".join(lines)
+
+
+def new_turn_messages(messages: List[ChatMessage]) -> List[ChatMessage]:
+    """The trailing messages that are NEW since the mapped conversation turn.
+
+    Continuation requests contain the full history; the DeepSeek conversation
+    already holds everything up to and including the assistant reply we
+    returned. The new information is: tool-result messages and/or the new
+    user message (everything after the last assistant echo). We detect it by
+    walking back to the last assistant message.
+    """
+    last_assistant = -1
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].role == "assistant":
+            last_assistant = i
+            break
+    if last_assistant < 0:
+        return messages
+    return messages[last_assistant + 1:]
+
+
+def build_first_prompt(messages: List[ChatMessage], tools: list) -> str:
+    """Prompt for a NEW DeepSeek conversation: history + tool instructions.
+
+    The tool instructions are placed BEFORE the trailing 'Assistant:' cue so
+    the model reads them as rules for ITS next turn, not as content to
+    answer about.
+    """
+    base = messages_to_prompt(messages)
+    instr = build_tool_instructions(tools or [])
+    if not instr:
+        return base
+    # Move the trailing 'Assistant:' cue to after the instructions.
+    cue = "\n\nAssistant:"
+    if base.endswith(cue):
+        return base[: -len(cue)].rstrip() + instr + cue
+    return base + instr
+
+
+def build_continuation_prompt(new_msgs: List[ChatMessage], tools: list,
+                              used_tool_call: bool) -> str:
+    """Prompt for a CONTINUING DeepSeek conversation: only the new information.
+
+    Tool results (role=tool) are rendered verbatim; a fresh user message is
+    labelled User; a short format reminder keeps tool-call compliance if the
+    previous turn was a tool call and tools are still offered.
+    """
+    parts = []
+    for m in new_msgs:
+        text = _text_of(m.content)
+        if m.role == "tool":
+            parts.append(format_tool_result(m.name or "tool", text))
+        elif m.role == "user":
+            parts.append(f"User: {text}")
+        elif m.role == "assistant":
+            # (assistant text between tool rounds — rare; include verbatim)
+            if text or m.tool_calls:
+                rendered = messages_to_prompt([m])
+                parts.append(rendered)
+        # system messages on continuation: ignore (the conversation already
+        # has the system context from turn 1; OpenCode repeats it verbatim)
+    out = "\n\n".join(p for p in parts if p)
+    if used_tool_call and tools:
+        out += ("\n\n[TOOL CALLING INSTRUCTION]\n"
+                "Remember: call tools with "
+                '<tool>{"name": "tool_name", "arguments": {...}}</tool> only.')
+    return out
 
 
 def _now() -> int:
@@ -57,18 +150,31 @@ def _id() -> str:
 
 
 def _est_tokens(text: str) -> int:
-    """Rough token estimate (~4 chars/token) — DeepSeek's web API gives us no count."""
+    """Rough token estimate (~4 chars/token) — DeepSeek's web API gives no count."""
     return max(1, len(text) // 4)
 
 
 def completion_response(model: str, content: str, prompt: str,
-                        conversation_id: str = None) -> dict:
+                        conversation_id: str = None,
+                        reasoning: str = "",
+                        tool_calls: List[ToolCall] = None) -> dict:
     """A full (non-streaming) OpenAI chat.completion object.
 
     `conversation_id` is an extra top-level field (outside OpenAI's schema) you
-    send back to resume the conversation.
+    can send back to resume the conversation. `reasoning_content` carries the
+    DeepThink reasoning (same field DeepSeek's official API uses). `tool_calls`
+    carries parsed structured tool calls.
     """
-    pt, ct = _est_tokens(prompt), _est_tokens(content)
+    pt, ct = _est_tokens(prompt), _est_tokens(content or "")
+    message: dict = {"role": "assistant", "content": content or None}
+    if reasoning:
+        message["reasoning_content"] = reasoning
+    if tool_calls:
+        message["tool_calls"] = [tc.to_openai(i) for i, tc in enumerate(tool_calls)]
+        message.pop("content", None) if content in (None, "") else None
+        if not content:
+            message["content"] = None
+    finish = "tool_calls" if tool_calls else "stop"
     return {
         "id": _id(),
         "object": "chat.completion",
@@ -78,8 +184,8 @@ def completion_response(model: str, content: str, prompt: str,
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": content},
-                "finish_reason": "stop",
+                "message": message,
+                "finish_reason": finish,
             }
         ],
         "usage": {
@@ -90,11 +196,14 @@ def completion_response(model: str, content: str, prompt: str,
     }
 
 
-def stream_chunks(model: str, stream: Iterable[str]) -> Iterable[str]:
-    """Yield OpenAI SSE lines (`data: {...}\\n\\n`) for a streamed completion.
+def stream_chunks(model: str, stream) -> Iterable[str]:
+    """Yield OpenAI SSE lines for a streamed completion.
 
-    `stream` is the client's stream object; after it's consumed we read its
-    `.conversation_id` and attach it to the final chunk.
+    `stream` yields typed events: ("content", delta) | ("reasoning", delta) |
+    ("tool_calls", [ToolCall]) | ("error", msg). Reasoning deltas use
+    `reasoning_content` (DeepSeek-API standard); tool calls are emitted as
+    OpenAI streaming tool_call deltas with `finish_reason: "tool_calls"`.
+    The stream's `.conversation_id` is attached to the final chunk.
     """
     cid, created = _id(), _now()
 
@@ -112,9 +221,27 @@ def stream_chunks(model: str, stream: Iterable[str]) -> Iterable[str]:
 
     # First frame announces the assistant role.
     yield frame({"role": "assistant", "content": ""})
-    for d in stream:
-        if d:
-            yield frame({"content": d})
+
+    saw_error = False
+    for kind, value in stream:
+        if kind == "content" and value:
+            yield frame({"content": value})
+        elif kind == "reasoning" and value:
+            yield frame({"reasoning_content": value})
+        elif kind == "tool_calls" and value:
+            # value: list[ToolCall]; emit as streaming deltas (index-based)
+            for i, tc in enumerate(value):
+                yield frame({"tool_calls": [tc.to_openai(i)]})
+        elif kind == "error" and value:
+            # upstream/protocol failure mid-stream: end the stream with an
+            # OpenAI-style error frame; nothing else follows
+            saw_error = True
+            err = {"error": {"message": str(value), "type": "upstream_error"}}
+            yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+
     conversation_id = getattr(stream, "conversation_id", None)
-    yield frame({}, finish="stop", extra={"conversation_id": conversation_id})
+    finish = getattr(stream, "finish_reason", "stop")
+    yield frame({}, finish=finish, extra={"conversation_id": conversation_id})
     yield "data: [DONE]\n\n"

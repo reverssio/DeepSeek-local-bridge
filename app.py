@@ -7,10 +7,19 @@ hand; run `python -m deepseek.auth` to do that ahead of time. Set
 DEEPSEEK_PROFILE_DIR to reuse an existing signed-in Chrome profile.
 """
 
+import faulthandler
 import os
+import signal
 
 import uvicorn
 from dotenv import load_dotenv
+
+# SIGUSR1 -> dump all thread stacks to stderr/log (debugging aid; stacks show
+# code locations only, never request payloads)
+try:
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
+except (AttributeError, ValueError):
+    pass
 
 load_dotenv()
 

@@ -40,8 +40,14 @@ command -v termux-wake-lock >/dev/null 2>&1 && termux-wake-lock >/dev/null 2>&1
 # optional: recover adb (for auth) — best effort, never fatal
 python "$DIR/tools/adb_autoconnect.py" >/dev/null 2>&1 || true
 
+# Rate limit: OpenCode sends ~3 requests per message (title + main + tool
+# continuation), so 30/min was too tight for normal agent use. 120/min per
+# client IP is still conservative for a single-user localhost bridge.
+export RATE_LIMIT_PER_MINUTE="${RATE_LIMIT_PER_MINUTE:-120}"
+
 cd "$DIR"
-PYTHONPATH="$DIR" nohup "$DIR/.venv/bin/python" app.py >>"$LOG" 2>&1 &
+PYTHONPATH="$DIR" RATE_LIMIT_PER_MINUTE="$RATE_LIMIT_PER_MINUTE" \
+    nohup "$DIR/.venv/bin/python" app.py >>"$LOG" 2>&1 &
 PID=$!
 echo "$PID" > "$PIDFILE"
 

@@ -40,6 +40,21 @@ else
     echo "session:  MISSING (run: python -m deepseek.auth after adb connect)"
 fi
 
+# conversation map (session-reuse state)
+if [ -f "$DIR/session/conv_map.json" ]; then
+    "$DIR/.venv/bin/python" - <<'EOF'
+import json
+try:
+    m = json.load(open("/data/data/com.termux/files/home/deepseek-api/session/conv_map.json"))
+    convs = {r["conversation_id"].split(":")[0] for r in m.values()}
+    print(f"convmap:  {len(m)} mapped OpenCode sessions -> {len(convs)} DeepSeek conversations")
+except Exception as e:
+    print(f"convmap:  unreadable ({type(e).__name__})")
+EOF
+else
+    echo "convmap:  (empty — first request will create it)"
+fi
+
 if command -v adb >/dev/null 2>&1; then
     DEVS="$(adb devices | grep -c $'\tdevice')"
     if [ "$DEVS" -gt 0 ]; then
