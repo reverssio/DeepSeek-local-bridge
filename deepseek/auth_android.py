@@ -432,21 +432,32 @@ def get_session(
     max_age: int = SESSION_MAX_AGE,
     allow_interactive: bool = True,
 ) -> Session:
-    """Return a usable session: cached file if fresh, else refresh via Chrome/CDP.
+    """Return a usable session.
 
-    If neither works and allow_interactive is True, prompts the user to log in
-    in Chrome (we watch for completion via CDP). Otherwise raises LoginRequired.
+    Policy (Android/Termux): OPTIMISTIC token reuse. The cached session file
+    is used as long as it exists — DeepSeek bearer tokens routinely outlive
+    our 6h heuristic (verified: token still valid 7.6h in), and attempting a
+    Chrome/CDP refresh on every stale-but-valid token blocks requests whenever
+    adb is disconnected. Real expiry is detected by the server (401/403 from
+    upstream), which then reports `login_required` to the client; only the
+    explicit `python -m deepseek.auth` command performs the interactive
+    Chrome flow.
+
+    If NO session file exists at all and interactive login is allowed, a
+    login is attempted (this only happens on first ever use).
     """
     cached = Session.load(session_file)
-    if cached and cached.age < max_age:
+    if cached is not None:
         return cached
-
-    session = _headless_refresh(profile_dir)
-    if session is not None:
-        return session
 
     if not allow_interactive:
         raise LoginRequired()
+
+    # No session at all — first ever use: try a headless capture (maybe Chrome
+    # is already signed in), then fall back to interactive login.
+    session = _headless_refresh(profile_dir)
+    if session is not None:
+        return session
 
     print("[auth] No valid session found — Chrome will open the sign-in page...")
     return login(assume_logged_out=True)

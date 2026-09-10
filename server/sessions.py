@@ -161,12 +161,34 @@ class ConversationMap:
 
     # -- matching -----------------------------------------------------------
 
+    def find_by_session(self, oc_session: str, model: str) -> Optional[dict]:
+        """Direct lookup by OpenCode session id (header) + model.
+
+        This is the PRIMARY mapping path when OpenCode sends its session id
+        (x-session-affinity / X-Session-Id, verified present in 1.18.27
+        traffic). One OpenCode session + model -> exactly one DeepSeek
+        conversation, regardless of message shape."""
+        if not oc_session:
+            return None
+        key = f"ocs:{oc_session}:{model}"
+        with self._lock:
+            rec = self._sessions.get(key)
+            if rec:
+                rec["last_used"] = time.time()
+                self._save()
+            return rec
+
     def find(self, messages: List[dict]) -> Optional[dict]:
-        """Return the session record this request continues, if any."""
+        """Return the session record this request continues, if any.
+
+        Fallback path when no session header is available: match by message
+        fingerprint (stored request prefix + assistant echo)."""
         norm = _norm_messages(messages)
         with self._lock:
             for key, rec in self._sessions.items():
                 stored_norm = rec.get("messages_norm")
+                if not stored_norm:
+                    continue  # session-keyed records don't fingerprint-match
                 # Match: stored request prefix + our returned assistant
                 # message(s) appended, then new trailing messages allowed.
                 assistant_echo = rec.get("assistant_echo_norm") or []
@@ -174,6 +196,36 @@ class ConversationMap:
                 if _match_prefix(full_stored, norm):
                     return rec
         return None
+
+    def remember_session(self, oc_session: str, model: str,
+                         conversation_id: str,
+                         ref_file_ids: Optional[list[str]] = None) -> None:
+        """Remember the DeepSeek conversation for an OpenCode session+model."""
+        if not oc_session or not conversation_id:
+            return
+        key = f"ocs:{oc_session}:{model}"
+        session_id, _, msg_part = conversation_id.partition(":")
+        msg_id = int(msg_part) if msg_part.isdigit() else None
+        with self._lock:
+            rec = self._sessions.get(key) or {
+                "created_at": time.time(),
+            }
+            existing_files = list(rec.get("ref_file_ids") or [])
+            if ref_file_ids:
+                for fid in ref_file_ids:
+                    if fid not in existing_files:
+                        existing_files.append(fid)
+            rec.update({
+                "conversation_id": conversation_id,
+                "chat_session_id": session_id,
+                "last_message_id": msg_id,
+                "model": model,
+                "ref_file_ids": existing_files,
+                "has_vision": bool(existing_files),
+                "last_used": time.time(),
+            })
+            self._sessions[key] = rec
+            self._save()
 
     def remember(self, key: str, messages: List[dict], conversation_id: str,
                  model: str, assistant_echo: Optional[List[dict]] = None,
@@ -225,6 +277,19 @@ class ConversationMap:
 # module-level singleton used by the server
 _map: Optional[ConversationMap] = None
 _map_lock = threading.Lock()
+_session_locks: dict[str, threading.Lock] = {}
+_session_locks_guard = threading.Lock()
+_fallback_session_lock = threading.Lock()
+
+
+def get_session_lock(oc_session: Optional[str]) -> threading.Lock:
+    """Return a concurrency-safe single-flight lock per OpenCode session."""
+    if not oc_session:
+        return _fallback_session_lock
+    with _session_locks_guard:
+        if oc_session not in _session_locks:
+            _session_locks[oc_session] = threading.Lock()
+        return _session_locks[oc_session]
 
 
 def get_map() -> ConversationMap:

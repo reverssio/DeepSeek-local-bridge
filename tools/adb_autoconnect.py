@@ -1,4 +1,4 @@
-#!/data/data/com.termux/files/usr/bin/python
+#!/usr/bin/env python3
 """Discover and connect to the phone's OWN wireless-adb service via mDNS.
 
 Android's wireless debugging publishes _adb-tls-connect._tcp.local over
@@ -18,6 +18,10 @@ import struct
 import subprocess
 import sys
 import time
+from pathlib import Path
+
+SESSION_DIR = Path(__file__).resolve().parent.parent / "session"
+ADB_TARGET_FILE = SESSION_DIR / "adb_target.txt"
 
 
 def parse_name(data: bytes, off: int):
@@ -107,9 +111,7 @@ def main() -> int:
 
     # 2) try the remembered target
     try:
-        saved = open(
-            "/data/data/com.termux/files/home/deepseek-api/session/adb_target.txt"
-        ).read().strip()
+        saved = ADB_TARGET_FILE.read_text().strip()
     except FileNotFoundError:
         saved = None
     if saved:
@@ -158,11 +160,8 @@ def main() -> int:
         if dev:
             print(f"adb connected via mDNS to {host}:{port} ({name})")
             try:
-                with open(
-                    "/data/data/com.termux/files/home/deepseek-api/session/adb_target.txt",
-                    "w",
-                ) as f:
-                    f.write(f"{host}:{port}\n")
+                SESSION_DIR.mkdir(parents=True, exist_ok=True)
+                ADB_TARGET_FILE.write_text(f"{host}:{port}\n")
             except OSError:
                 pass
             return 0
