@@ -40,6 +40,16 @@ THINK = "THINK"
 RESPONSE = "RESPONSE"
 
 
+def format_search_citations(search_results: list[dict]) -> str:
+    """Format DeepSeek search results into Markdown citation references."""
+    if not search_results:
+        return ""
+    valid = [r for r in search_results if isinstance(r, dict) and r.get("cite_index") and r.get("url")]
+    valid.sort(key=lambda r: int(r.get("cite_index", 0)))
+    lines = [f"[{r['cite_index']}]: [{r.get('title', 'Source')}]({r['url']})" for r in valid]
+    return "\n\n" + "\n".join(lines) if lines else ""
+
+
 class Fragments:
     """Mutable view of the response's fragment list as patches arrive."""
 
@@ -94,6 +104,10 @@ def parse_sse_events(lines, meta: Optional[dict] = None) -> Iterator[tuple]:
     )
     emitted_first: dict[int, bool] = {}  # fragment id -> initial content emitted
 
+    search_results: list[dict] = []
+    if meta is not None:
+        meta["search_results"] = search_results
+
     for line in lines:
         if not line or not line.startswith("data:"):
             continue
@@ -108,6 +122,10 @@ def parse_sse_events(lines, meta: Optional[dict] = None) -> Iterator[tuple]:
         v = obj.get("v")
         p = obj.get("p")
         o = obj.get("o")
+
+        # Capture response_message_id from top-level framing if present
+        if meta is not None and isinstance(obj.get("response_message_id"), int):
+            meta["message_id"] = obj["response_message_id"]
 
         # --- snapshot frame: full response object -------------------------
         if isinstance(v, dict) and "response" in v:
@@ -158,11 +176,30 @@ def parse_sse_events(lines, meta: Optional[dict] = None) -> Iterator[tuple]:
                     yield ("reasoning" if ftype == THINK else "content", v)
                 continue
 
+            # Search results.
+            if p == "response/search_results" and isinstance(v, list):
+                if o != "BATCH":
+                    search_results.clear()
+                    search_results.extend([x for x in v if isinstance(x, dict)])
+                else:
+                    for op in v:
+                        if isinstance(op, dict) and "p" in op and "v" in op:
+                            import re as _re
+                            m = _re.match(r"^(\d+)/cite_index$", str(op.get("p", "")))
+                            if m:
+                                idx = int(m.group(1))
+                                if idx < len(search_results):
+                                    search_results[idx]["cite_index"] = op["v"]
+                continue
+
             # Status transitions.
             if p == "response/status" and isinstance(v, str):
                 if meta is not None:
                     meta["status"] = v
                 if v == "FINISHED":
+                    citations = format_search_citations(search_results)
+                    if citations:
+                        yield ("content", citations)
                     yield ("finish", None)
             continue
 

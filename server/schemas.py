@@ -19,6 +19,11 @@ class ChatMessage(BaseModel):
     # tool role message fields
     tool_call_id: Optional[str] = None
     name: Optional[str] = None
+    # Reasoning echo: with interleaved:{field:"reasoning_content"} configured,
+    # OpenCode replays past assistant reasoning back on the assistant message.
+    # We accept and (see openai_format) forward it so DeepSeek sees its own
+    # prior reasoning during tool-call trajectories.
+    reasoning_content: Optional[str] = None
 
 
 class ChatCompletionRequest(BaseModel):
@@ -34,6 +39,11 @@ class ChatCompletionRequest(BaseModel):
     # DeepSeek toggles (extra_body extras)
     thinking: bool = False
     search: bool = False
+    # OpenCode variant passthroughs (openai-compatible maps reasoningEffort
+    # -> reasoning_effort and thinkingBudget -> thinking_budget in the body).
+    # Any non-null value means "thinking requested".
+    reasoning_effort: Optional[str] = None
+    thinking_budget: Optional[int] = None
     # Accepted for compatibility but not all are forwarded to DeepSeek.
     temperature: Optional[float] = None
     top_p: Optional[float] = None

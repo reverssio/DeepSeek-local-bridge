@@ -21,6 +21,7 @@ session (see `deepseek.auth`). For each message it:
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import threading
 from dataclasses import dataclass
@@ -31,6 +32,8 @@ import httpx
 from .auth import Session, get_session
 from .pow import DeepSeekPow
 from .sse import parse_sse_events
+
+_pow_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="deepseek-pow")
 
 BASE = "https://chat.deepseek.com"
 COMPLETION_PATH = "/api/v0/chat/completion"
@@ -98,6 +101,7 @@ class DeepSeekClient:
         # The wasmtime Store behind the PoW solver is not reentrant; serialise
         # access so concurrent server requests don't corrupt it.
         self._pow_lock = threading.Lock()
+        self._auth_lock = threading.Lock()
         # Android note: when the phone switches Wi-Fi <-> mobile data, already
         # established (pooled, keep-alive) TCP sockets to chat.deepseek.com die
         # silently -- no FIN/RST arrives, so a request sent on one stalls until
@@ -146,14 +150,35 @@ class DeepSeekClient:
         print(f"[deepseek] created chat_session {sid}", flush=True)
         return sid
 
-    def _pow_header(self, target_path: str = COMPLETION_PATH) -> str:
+    def refresh_auth(self) -> bool:
+        """Attempt single-flight reload or headless refresh of session token."""
+        with self._auth_lock:
+            try:
+                from .auth import get_session
+                new_sess = get_session(allow_interactive=False)
+                if new_sess and new_sess.token:
+                    self.session = new_sess
+                    self._http.headers.update(self._base_headers())
+                    self._http.cookies.update(self.session.cookies)
+                    print("[auth] refreshed session token successfully", flush=True)
+                    return True
+            except Exception as e:
+                print(f"[auth] session refresh failed: {e}", flush=True)
+            return False
+
+    def _pow_header(self, target_path: str = COMPLETION_PATH, timeout: float = 15.0) -> str:
         r = self._http.post(
             "/api/v0/chat/create_pow_challenge", json={"target_path": target_path}
         )
         r.raise_for_status()
         challenge = _biz(r.json())["challenge"]
-        with self._pow_lock:
-            return self._pow.make_header(challenge)
+
+        def _solve():
+            with self._pow_lock:
+                return self._pow.make_header(challenge)
+
+        future = _pow_executor.submit(_solve)
+        return future.result(timeout=timeout)
 
     # --- public API ---------------------------------------------------------
 
@@ -164,6 +189,7 @@ class DeepSeekClient:
         model: Optional[str] = None,
         thinking: bool = False,
         search: bool = False,
+        ref_file_ids: Optional[list[str]] = None,
     ) -> "_Stream":
         """Stream a reply. Iterate it for text chunks; read `.conversation_id`
         afterwards to resume the thread. Pass an existing `conversation_id` to
@@ -188,7 +214,7 @@ class DeepSeekClient:
         else:
             # Resuming: let the existing thread's model stand (send no model_type).
             model_type = None
-        return _Stream(self, prompt, session_id, parent_id, model_type, thinking, search)
+        return _Stream(self, prompt, session_id, parent_id, model_type, thinking, search, ref_file_ids=ref_file_ids)
 
     def chat(
         self,
@@ -197,11 +223,13 @@ class DeepSeekClient:
         model: Optional[str] = None,
         thinking: bool = False,
         search: bool = False,
+        ref_file_ids: Optional[list[str]] = None,
     ) -> Reply:
         """Return the complete reply (`.text`, `.reasoning`) plus its
         `.conversation_id`."""
         s = self.stream(prompt, conversation_id=conversation_id,
-                        model=model, thinking=thinking, search=search)
+                        model=model, thinking=thinking, search=search,
+                        ref_file_ids=ref_file_ids)
         text, reasoning = [], []
         for kind, delta in s.events():
             if kind == "content":
@@ -223,7 +251,8 @@ class _Stream:
 
     def __init__(self, client: "DeepSeekClient", prompt: str, session_id: str,
                  parent_id: Optional[int], model: str,
-                 thinking: bool, search: bool):
+                 thinking: bool, search: bool,
+                 ref_file_ids: Optional[list[str]] = None):
         self._client = client
         self._prompt = prompt
         self._session_id = session_id
@@ -231,14 +260,15 @@ class _Stream:
         self._model = model
         self._thinking = thinking
         self._search = search
-        self._message_id: Optional[int] = None
+        self._ref_file_ids = ref_file_ids or []
+        self._message_id: Optional[int] = parent_id
 
     def events(self):
         body = {
             "chat_session_id": self._session_id,
             "parent_message_id": self._parent_id,
             "prompt": self._prompt,
-            "ref_file_ids": [],
+            "ref_file_ids": self._ref_file_ids,
             "thinking_enabled": self._thinking,
             "search_enabled": self._search,
             "action": None,
@@ -271,7 +301,9 @@ class _Stream:
                 break
             except (httpx.TransportError, httpx.HTTPStatusError) as e:
                 if attempt == 0 and not yielded_any:
-                    continue  # single bounded retry with fresh PoW
+                    if isinstance(e, httpx.HTTPStatusError) and e.response.status_code in (401, 403):
+                        self._client.refresh_auth()
+                    continue  # single bounded retry with fresh PoW and auth
                 if yielded_any:
                     raise RuntimeError(
                         "DeepSeek stream interrupted mid-response (network "

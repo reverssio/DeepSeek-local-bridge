@@ -19,7 +19,12 @@ import uuid
 from typing import Iterable, List
 
 from .schemas import ChatMessage
-from .tools_bridge import ToolCall, build_tool_instructions, format_tool_result
+from .tools_bridge import (
+    ToolCall,
+    build_tool_instructions,
+    format_tool_result,
+    get_tool_nonce,
+)
 
 _ROLE_LABELS = {"system": "System", "user": "User", "assistant": "Assistant"}
 
@@ -47,6 +52,15 @@ def messages_to_prompt(messages: List[ChatMessage]) -> str:
     if len(messages) == 1 and messages[0].role == "user":
         return _text_of(messages[0].content)
 
+    tool_id_to_name = {}
+    for m in messages:
+        if m.role == "assistant" and m.tool_calls:
+            for tc in m.tool_calls:
+                tid = tc.get("id")
+                fn = tc.get("function", {}).get("name")
+                if tid and fn:
+                    tool_id_to_name[tid] = fn
+
     lines = []
     for m in messages:
         label = _ROLE_LABELS.get(m.role, m.role.capitalize())
@@ -54,6 +68,11 @@ def messages_to_prompt(messages: List[ChatMessage]) -> str:
         # assistant tool-call echo -> render back into the instructed markup so
         # the model sees its own request shape
         if m.role == "assistant" and m.tool_calls:
+            # prior reasoning (replayed by OpenCode with interleaved
+            # reasoning_content) is preserved so the model sees its own
+            # thought process across tool rounds
+            if getattr(m, "reasoning_content", None):
+                lines.append(f"Assistant (thinking): {m.reasoning_content}")
             for tc in m.tool_calls:
                 fn = tc.get("function", {})
                 try:
@@ -66,7 +85,8 @@ def messages_to_prompt(messages: List[ChatMessage]) -> str:
                 lines.append(f"Assistant: {text}")
             continue
         if m.role == "tool":
-            lines.append(f"User: {format_tool_result(m.name or 'tool', text)}")
+            tname = m.name or tool_id_to_name.get(m.tool_call_id) or "tool"
+            lines.append(f"User: {format_tool_result(tname, text)}")
             continue
         lines.append(f"{label}: {text}")
     if messages and messages[-1].role != "assistant":
@@ -101,7 +121,8 @@ def build_first_prompt(messages: List[ChatMessage], tools: list) -> str:
     answer about.
     """
     base = messages_to_prompt(messages)
-    instr = build_tool_instructions(tools or [])
+    nonce = get_tool_nonce(tools) if tools else None
+    instr = build_tool_instructions(tools or [], nonce=nonce)
     if not instr:
         return base
     # Move the trailing 'Assistant:' cue to after the instructions.
@@ -112,18 +133,32 @@ def build_first_prompt(messages: List[ChatMessage], tools: list) -> str:
 
 
 def build_continuation_prompt(new_msgs: List[ChatMessage], tools: list,
-                              used_tool_call: bool) -> str:
+                              used_tool_call: bool,
+                              all_messages: Optional[List[ChatMessage]] = None) -> str:
     """Prompt for a CONTINUING DeepSeek conversation: only the new information.
 
-    Tool results (role=tool) are rendered verbatim; a fresh user message is
-    labelled User; a short format reminder keeps tool-call compliance if the
-    previous turn was a tool call and tools are still offered.
+    Tool results (role=tool) are rendered with their canonical tool name;
+    a fresh user message is labelled User; tool definitions and instructions
+    are preserved so the model retains tool schemas and invocation contracts.
     """
+    tool_id_to_name = {}
+    if all_messages:
+        for m in all_messages:
+            if m.role == "assistant" and m.tool_calls:
+                for tc in m.tool_calls:
+                    tid = tc.get("id")
+                    fn = tc.get("function", {}).get("name")
+                    if tid and fn:
+                        tool_id_to_name[tid] = fn
+
     parts = []
+    has_tool_result = False
     for m in new_msgs:
         text = _text_of(m.content)
         if m.role == "tool":
-            parts.append(format_tool_result(m.name or "tool", text))
+            has_tool_result = True
+            tname = m.name or tool_id_to_name.get(m.tool_call_id) or "tool"
+            parts.append(format_tool_result(tname, text))
         elif m.role == "user":
             parts.append(f"User: {text}")
         elif m.role == "assistant":
@@ -133,11 +168,19 @@ def build_continuation_prompt(new_msgs: List[ChatMessage], tools: list,
                 parts.append(rendered)
         # system messages on continuation: ignore (the conversation already
         # has the system context from turn 1; OpenCode repeats it verbatim)
+
+    if has_tool_result:
+        parts.append(
+            "Continue the task using the tool results above. Do NOT repeat tool calls that already "
+            "succeeded; perform the next step or give the final answer."
+        )
+
     out = "\n\n".join(p for p in parts if p)
-    if used_tool_call and tools:
-        out += ("\n\n[TOOL CALLING INSTRUCTION]\n"
-                "Remember: call tools with "
-                '<tool>{"name": "tool_name", "arguments": {...}}</tool> only.')
+    if tools:
+        nonce = get_tool_nonce(tools) if tools else None
+        instr = build_tool_instructions(tools, nonce=nonce)
+        if instr:
+            out += instr
     return out
 
 
@@ -223,15 +266,17 @@ def stream_chunks(model: str, stream) -> Iterable[str]:
     yield frame({"role": "assistant", "content": ""})
 
     saw_error = False
+    tc_index = 0
     for kind, value in stream:
         if kind == "content" and value:
             yield frame({"content": value})
         elif kind == "reasoning" and value:
             yield frame({"reasoning_content": value})
         elif kind == "tool_calls" and value:
-            # value: list[ToolCall]; emit as streaming deltas (index-based)
-            for i, tc in enumerate(value):
-                yield frame({"tool_calls": [tc.to_openai(i)]})
+            # value: list[ToolCall]; emit as streaming deltas with monotonic sequential index
+            for tc in value:
+                yield frame({"tool_calls": [tc.to_openai(tc_index)]})
+                tc_index += 1
         elif kind == "error" and value:
             # upstream/protocol failure mid-stream: end the stream with an
             # OpenAI-style error frame; nothing else follows
