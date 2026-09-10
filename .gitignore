@@ -1,16 +1,46 @@
+# Python virtual environments
+.venv/
 venv/
-__pycache__/
-*.pyc
-.env
+env/
+ENV/
 
-# Session artifacts — contain session tokens + cookies. NEVER commit.
-session.json
-session
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Testing and coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environment files and credentials
+.env
+.env.local
+.env.*.local
 *.env.*
 !.env.example
-CLAUDE.md
-# Termux runtime artifacts
+
+# Authentication and session persistence (NEVER commit tokens/cookies)
+session/
+session.json
+*.session
+
+# Logs and runtime PID tracking
 logs/
+*.log
 server.log
 server.pid
-*.log
+*.pid
+
+# Operating system and editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Local agent artifacts
+CLAUDE.md

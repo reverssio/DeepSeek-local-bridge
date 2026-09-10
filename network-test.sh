@@ -1,4 +1,4 @@
-#!/data/data/com.termux/files/usr/bin/bash
+#!/bin/sh
 # Network diagnostics for the local DeepSeek API setup.
 # Safe output: never prints tokens, cookies, or auth headers.
 set -u
@@ -72,9 +72,10 @@ python "$DIR/tools/adb_autoconnect.py" 2>&1 | sed 's/^/  /'
 
 line "11. upstream API auth check (no secrets printed)"
 if [ -f "$DIR/session/session.json" ]; then
-    "$DIR/.venv/bin/python" - <<'EOF'
-import json, sys, time
-sys.path.insert(0, "/data/data/com.termux/files/home/deepseek-api")
+    (cd "$DIR" && "$DIR/.venv/bin/python" - <<'EOF'
+import json, sys, time, os
+from pathlib import Path
+sys.path.insert(0, os.getcwd())
 try:
     from deepseek.client import DeepSeekClient
     c = DeepSeekClient(allow_interactive=False)

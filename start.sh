@@ -1,4 +1,4 @@
-#!/data/data/com.termux/files/usr/bin/bash
+#!/bin/sh
 # Start the DeepSeek local API server (localhost only).
 # - refuses to double-start (PID file + /healthz check)
 # - takes a Termux wake-lock so Android doesn't freeze the server
@@ -37,8 +37,19 @@ fi
 # wake-lock so background execution isn't frozen (CPU only, no display)
 command -v termux-wake-lock >/dev/null 2>&1 && termux-wake-lock >/dev/null 2>&1
 
-# optional: recover adb (for auth) — best effort, never fatal
-python "$DIR/tools/adb_autoconnect.py" >/dev/null 2>&1 || true
+# Find Python binary (virtualenv preferred)
+if [ -x "$DIR/.venv/bin/python" ]; then
+    PY_BIN="$DIR/.venv/bin/python"
+elif [ -x "$DIR/venv/bin/python" ]; then
+    PY_BIN="$DIR/venv/bin/python"
+elif command -v python3 >/dev/null 2>&1; then
+    PY_BIN="python3"
+else
+    PY_BIN="python"
+fi
+
+# optional: recover adb (for auth) — best effort in background, never blocks
+"$PY_BIN" "$DIR/tools/adb_autoconnect.py" >/dev/null 2>&1 &
 
 # Rate limit: OpenCode sends ~3 requests per message (title + main + tool
 # continuation), so 30/min was too tight for normal agent use. 120/min per
@@ -47,7 +58,7 @@ export RATE_LIMIT_PER_MINUTE="${RATE_LIMIT_PER_MINUTE:-120}"
 
 cd "$DIR"
 PYTHONPATH="$DIR" RATE_LIMIT_PER_MINUTE="$RATE_LIMIT_PER_MINUTE" \
-    nohup "$DIR/.venv/bin/python" app.py >>"$LOG" 2>&1 &
+    nohup "$PY_BIN" app.py >>"$LOG" 2>&1 &
 PID=$!
 echo "$PID" > "$PIDFILE"
 

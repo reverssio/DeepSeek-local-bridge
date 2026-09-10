@@ -1,281 +1,496 @@
-# DeepSeek API: a free LLM API powered by DeepSeek
+# DeepSeek Local Bridge
 
-**Using your own DeepSeek account.** No API key, no credits, no paid plan: it turns the free chat at [chat.deepseek.com](https://chat.deepseek.com) into an API you can call from code.
-
-You can use it in two ways:
-
-- 🐍 **As a Python library:** just call `client.chat("Hi")`. Supports streaming and multi-turn conversations.
-- 🔌 **As a local OpenAI-compatible API:** runs a server at `http://localhost:8000/v1` that speaks the OpenAI format, so the official `openai` SDK (and any OpenAI-compatible app) works as a drop-in, with `localhost` in place of OpenAI.
-
-You sign in once in a browser with your DeepSeek account; your session is saved and refreshed automatically after that.
-
-> **Unofficial project.** Not affiliated with or endorsed by DeepSeek. It automates the consumer DeepSeek web experience for personal use, so use it responsibly and within DeepSeek's terms.
+OpenAI-compatible local API server and client library bridging the DeepSeek Web interface to developer tooling, autonomous coding agents, and OpenAI SDK integrations.
 
 ---
 
-## Table of contents
+## Overview
 
-- [Why use this?](#why-use-this)
-- [Requirements](#requirements)
-- [Setup (2 minutes)](#setup-2-minutes)
-- [Usage 1: In Python (no server)](#usage-1-in-python-no-server)
-- [Usage 2: As an OpenAI-compatible server](#usage-2-as-an-openai-compatible-server)
-- [Command line](#command-line)
-- [Human-check & proof-of-work (automatic)](#human-check--proof-of-work-automatic)
-- [Models, DeepThink & web search](#models-deepthink--web-search)
-- [Concurrency](#concurrency)
-- [Rate limiting](#rate-limiting)
-- [Project layout](#project-layout)
-- [Notes & limitations](#notes--limitations)
+DeepSeek Local Bridge turns a personal DeepSeek Web account into a local API endpoint operating at `http://127.0.0.1:8000/v1`. It translates standard OpenAI chat completion requests into DeepSeek Web API protocol transactions, enabling local tools and AI agents to utilize DeepSeek models with full support for:
+
+- Streaming responses and DeepThink reasoning traces (`reasoning_content`)
+- Structured tool and function calling across multiple markup dialects
+- Genuine multimodal image analysis from local files, data URIs, and remote URLs
+- Strict 1-to-1 session affinity and upstream conversation persistence
+- Fast, local, zero-overhead conversation title generation for OpenCode
+- Automatic proof-of-work (PoW) challenge resolution via WebAssembly
+- Multi-tier authentication recovery and headless session management
+
+> **Disclaimer**: This is an independent, open-source project. It is not affiliated with, endorsed by, or sponsored by DeepSeek. It automates web interface transactions for personal development use. Please use responsibly and in accordance with DeepSeek's Terms of Service.
+
+---
+
+## Table of Contents
+
+- [Supported Environments](#supported-environments)
+- [Architecture](#architecture)
+- [Prerequisites and Requirements](#prerequisites-and-requirements)
+- [Installation](#installation)
+- [Authentication and Setup](#authentication-and-setup)
+  - [Desktop Environments (Linux / macOS / Windows)](#desktop-environments-linux--macos--windows)
+  - [Android and Termux (Non-Rooted)](#android-and-termux-non-rooted)
+- [Running the Server](#running-the-server)
+- [Verification and Health Checks](#verification-and-health-checks)
+- [OpenCode Integration](#opencode-integration)
+- [API Usage Examples](#api-usage-examples)
+  - [cURL](#curl)
+  - [Python OpenAI SDK](#python-openai-sdk)
+  - [Direct Python Library](#direct-python-library)
+- [Multimodal Vision Support](#multimodal-vision-support)
+- [Session Management and Upstream Conversation Reuse](#session-management-and-upstream-conversation-reuse)
+- [Configuration Reference](#configuration-reference)
+- [Project Layout](#project-layout)
+- [Security Considerations](#security-considerations)
+- [Troubleshooting](#troubleshooting)
+- [Known Limitations](#known-limitations)
 - [License](#license)
 
 ---
 
-## Why use this?
+## Supported Environments
 
-- **Free:** uses your normal signed-in DeepSeek account, no API billing.
-- **Drop-in OpenAI replacement:** point any OpenAI client at `localhost` and it just works.
-- **Full DeepSeek toolset:** pick the fast or expert model, and toggle DeepThink reasoning and web search per request.
-- **Streaming + conversations:** token-by-token output and multi-turn threads addressed by `conversation_id`.
-
----
-
-## Requirements
-
-- **Python 3.9+**
-- A **DeepSeek account** (the free one you use for [chat.deepseek.com](https://chat.deepseek.com) is fine)
-- Works on Windows, macOS, and Linux
+| Environment | Status | Verification Details |
+|---|---|---|
+| **Android / Termux (aarch64)** | Fully Supported & Verified | Tested on native Termux (non-rooted) with Android 10+ via Wireless Debugging (ADB CDP). |
+| **Linux (x86_64, aarch64)** | Fully Supported | Tested with Playwright Chromium and Python 3.9–3.14. |
+| **macOS (Apple Silicon, Intel)** | Compatible | Supports Playwright Chromium and standard Python 3.9+. |
+| **Windows (x64)** | Compatible | Supports PowerShell and CMD via Playwright Chromium. |
 
 ---
 
-## Setup (2 minutes)
+## Architecture
 
-```bash
-# 1. Clone the project
-git clone https://github.com/sums001/Deepseek-API.git
-cd "Deepseek-API"
+```
+[ OpenCode / OpenAI Client ]
+            │  POST /v1/chat/completions (OpenAI Schema)
+            ▼
+┌────────────────────────────────────────────────────────┐
+│ DeepSeek Local Bridge (FastAPI @ localhost:8000)       │
+├────────────────────────────────────────────────────────┤
+│ • Rate Limiter & Concurrency Manager                  │
+│ • Session Affinity (OpenCode ID ──> DeepSeek Chat ID)  │
+│ • Local Title Generator (<1ms, 0 upstream cost)        │
+│ • Multimodal Ingestion (Path / DataURI / URL)          │
+│ • Tool Tag & Nonce Binding Bridge                     │
+└────────────────────────────────────────────────────────┘
+            │  chat.deepseek.com internal HTTPS / SSE
+            ▼
+┌────────────────────────────────────────────────────────┐
+│ DeepSeek Web Services                                  │
+├────────────────────────────────────────────────────────┤
+│ • PoW Challenge Solver (WASM in background threadpool) │
+│ • File Upload & Polling (/api/v0/file/upload_file)     │
+│ • SSE Fragment Stream Parser (THINK vs RESPONSE)       │
+└────────────────────────────────────────────────────────┘
 ```
 
-**2. Create and activate a virtual environment**
+---
 
-On **macOS / Linux**:
+## Prerequisites and Requirements
+
+- **Python**: Version 3.9 or higher (tested up to Python 3.14).
+- **DeepSeek Account**: Standard personal account registered at [chat.deepseek.com](https://chat.deepseek.com).
+- **Network Access**: Outbound HTTPS connectivity to `https://chat.deepseek.com`.
+- **Environment-Specific Tools**:
+  - *Desktop*: Chromium browser (installed automatically via `playwright`).
+  - *Android / Termux*: Google Chrome installed on the device, Android Wireless Debugging enabled, and `android-tools` installed in Termux.
+
+---
+
+## Installation
+
+### 1. Clone the Repository
 
 ```bash
-python3 -m venv venv
-source venv/bin/activate
+git clone https://github.com/reverssio/DeepSeek-local-bridge.git
+cd DeepSeek-local-bridge
 ```
 
-On **Windows** (PowerShell):
+### 2. Create and Activate Virtual Environment
+
+On Linux, macOS, or Termux:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+On Windows (PowerShell):
 
 ```powershell
-python -m venv venv
-venv\Scripts\Activate.ps1
+python -m venv .venv
+.venv\Scripts\Activate.ps1
 ```
 
-> On Windows you may need to allow script execution once: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`. In `cmd.exe` activate with `venv\Scripts\activate.bat` instead.
-
-**3. Install dependencies and sign in**
+### 3. Install Dependencies
 
 ```bash
-# Install dependencies
+pip install --upgrade pip
 pip install -r requirements.txt
-
-# Install the browser Playwright needs (one-time)
-playwright install chromium
-
-# Sign in once: a browser opens, log into your DeepSeek account
-python -m deepseek.auth
 ```
-
-The login window opens so you can sign in by hand and solve the human-check once. After that your session (bearer token + cookies) is saved under `session/` (git-ignored, never shared) and reused on every run — the cached session is refreshed automatically, so your first request works right away.
-
-> The server can also open this window for you on demand the first time it needs a session, so this step is optional for local single-user use.
 
 ---
 
-## Usage 1: In Python (no server)
+## Authentication and Setup
 
-The simplest way if your code is already Python.
+The bridge communicates with DeepSeek Web using a captured session token and cookies. This session is refreshed automatically once acquired and saved in `session/session.json` (excluded from git).
 
-```python
-from deepseek import DeepSeekClient
+### Desktop Environments (Linux / macOS / Windows)
 
-client = DeepSeekClient()                # loads your signed-in session
+1. Install Playwright browser dependencies:
+   ```bash
+   playwright install chromium
+   ```
+2. Run the interactive login utility:
+   ```bash
+   python -m deepseek.auth
+   ```
+3. A browser window will open. Log in to your DeepSeek account and solve any human verification puzzle. Once logged in, the utility captures the session credentials to `session/session.json` and closes the browser.
 
-# Get a full reply
-reply = client.chat("Say hello in one short sentence.")
-print(reply.text)
+### Android and Termux (Non-Rooted)
 
-# Continue the SAME conversation — pass the id back
-reply2 = client.chat("And now in French?", conversation_id=reply.conversation_id)
-print(reply2.text)
+On Android devices, Chrome runs in a sandboxed application space. Termux connects to Chrome via Android's built-in Chrome Developer Protocol (CDP) through Wireless Debugging:
 
-# Stream the answer as it's typed
-for chunk in client.stream("Tell me a short joke"):
-    print(chunk, end="", flush=True)
-```
-
-`chat()` returns the full text plus a `conversation_id`; pass that id back to keep the thread going, or omit it to start fresh. `stream()` yields the reply piece by piece.
-
-👉 More: [examples/01_direct_chat.py](examples/01_direct_chat.py), [02_direct_conversation.py](examples/02_direct_conversation.py), [03_direct_stream.py](examples/03_direct_stream.py)
+1. Install required packages in Termux:
+   ```bash
+   pkg install -y android-tools curl
+   ```
+2. Enable Developer Options on your Android device:
+   - Go to **Settings > About Phone** and tap **Build Number** 7 times.
+   - Go to **Settings > System > Developer Options**.
+   - Enable **Wireless Debugging**.
+3. Pair and connect ADB locally in Termux:
+   - Open Wireless Debugging, tap **Pair device with pairing code**. Note the IP, Port, and 6-digit code.
+   - In Termux:
+     ```bash
+     adb pair 127.0.0.1:<pairing_port> <pairing_code>
+     adb connect 127.0.0.1:<connect_port>
+     ```
+4. Start Chrome with remote debugging enabled:
+   - Close all existing Chrome tabs.
+   - Launch Chrome from Termux with CDP enabled:
+     ```bash
+     am start -n com.android.chrome/com.google.android.apps.chrome.Main -d "https://chat.deepseek.com" --es "args" "--remote-debugging-port=9222"
+     ```
+5. Forward the CDP port to Termux:
+   ```bash
+   adb forward tcp:9222 localabstract:chrome_devtools_remote
+   ```
+6. Run the Android auth capture script:
+   ```bash
+   python -m deepseek.auth_android
+   ```
+   Log in to DeepSeek in the opened Chrome tab. The script will detect your active login, extract the bearer token and security cookies, and save them to `session/session.json`.
 
 ---
 
-## Usage 2: As an OpenAI-compatible server
+## Running the Server
 
-Start a local server that speaks the OpenAI API, so existing OpenAI tools and SDKs work unchanged.
+### Starting the Daemon
+
+On Linux or Termux:
+
+```bash
+./start.sh
+```
+
+Or run directly with Python:
 
 ```bash
 python app.py
-# -> DeepSeek OpenAI-compatible API on http://127.0.0.1:8000
 ```
 
-Then point any OpenAI client at it (the API key is required by the SDK but ignored):
+`./start.sh` automatically:
+- Acquires a Termux CPU wake-lock (preventing Android background suspension)
+- Reconnects ADB if needed via mDNS
+- Starts `uvicorn` bound to `127.0.0.1:8000`
+- Verifies server health at `http://127.0.0.1:8000/healthz`
+- Stores the background process ID in `server.pid` and writes logs to `logs/server.log`
+
+### Checking Status
+
+```bash
+./status.sh
+```
+
+Outputs:
+- Server execution state (PID, health status)
+- Session freshness and cookie count
+- Count of active mapped conversations
+- Local ADB connection status
+
+### Stopping the Server
+
+```bash
+./stop.sh
+```
+
+Terminates background server instances and releases any active Termux wake-lock.
+
+---
+
+## Verification and Health Checks
+
+1. Verify endpoint reachability:
+   ```bash
+   curl http://127.0.0.1:8000/healthz
+   # Output: {"status":"ok"}
+   ```
+
+2. Verify model catalog:
+   ```bash
+   curl http://127.0.0.1:8000/v1/models
+   ```
+
+3. Run the automated network diagnostics suite:
+   ```bash
+   ./network-test.sh
+   ```
+
+---
+
+## OpenCode Integration
+
+DeepSeek Local Bridge is designed for direct pairing with [OpenCode](https://github.com/anomalyco/opencode) as a local OpenAI-compatible provider.
+
+Add the following provider configuration to `~/.config/opencode/opencode.json`:
+
+```json
+{
+  "provider": {
+    "deepseek-local": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "DeepSeek (Local Bridge)",
+      "options": {
+        "baseURL": "http://127.0.0.1:8000/v1"
+      },
+      "models": {
+        "deepseek-chat": {
+          "name": "DeepSeek Chat (Instant)",
+          "limit": {
+            "context": 64000,
+            "output": 8000
+          },
+          "modalities": {
+            "input": ["text", "image"],
+            "output": ["text"]
+          },
+          "reasoning": true,
+          "interleaved": {
+            "field": "reasoning_content"
+          },
+          "variants": {
+            "default": {},
+            "reasoning": {
+              "reasoningEffort": "medium"
+            }
+          }
+        },
+        "deepseek-expert": {
+          "name": "DeepSeek Expert",
+          "limit": {
+            "context": 64000,
+            "output": 8000
+          },
+          "modalities": {
+            "input": ["text", "image"],
+            "output": ["text"]
+          },
+          "reasoning": true,
+          "interleaved": {
+            "field": "reasoning_content"
+          },
+          "variants": {
+            "default": {},
+            "reasoning": {
+              "reasoningEffort": "medium"
+            }
+          }
+        }
+      }
+    }
+  },
+  "agent": {
+    "title": {}
+  }
+}
+```
+
+### Key OpenCode Features Handled by the Bridge
+
+- **Session Affinity**: The bridge reads OpenCode's `x-session-affinity` / `session-id` headers and maintains a strictly persistent upstream DeepSeek Web conversation for each OpenCode thread.
+- **Local Title Generation**: OpenCode's background title requests (`agent="title"`) are intercepted and resolved locally in $<100\text{ ms}$ without creating throwaway conversations upstream.
+- **Tool Calling**: Agent tools (`bash`, `edit`, `read`, `write`, `grep`, `glob`, etc.) are converted to structured tool tags with cryptographic nonces preventing model hallucination.
+
+---
+
+## API Usage Examples
+
+### cURL
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek-chat",
+    "messages": [
+      {"role": "user", "content": "Explain quantum entanglement in two sentences."}
+    ],
+    "stream": false
+  }'
+```
+
+### Python OpenAI SDK
 
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
-
-resp = client.chat.completions.create(
-    model="deepseek-chat",
-    messages=[{"role": "user", "content": "Hello!"}],
+client = OpenAI(
+    base_url="http://127.0.0.1:8000/v1",
+    api_key="not-needed"
 )
-print(resp.choices[0].message.content)
+
+# Streamed completion with DeepThink reasoning
+response = client.chat.completions.create(
+    model="deepseek-expert",
+    messages=[
+        {"role": "user", "content": "Write a Python function to compute Fibonacci numbers."}
+    ],
+    stream=True,
+    extra_body={"thinking": True}
+)
+
+for chunk in response:
+    delta = chunk.choices[0].delta
+    if hasattr(delta, "reasoning_content") and delta.reasoning_content:
+        print(f"[Thinking] {delta.reasoning_content}", end="", flush=True)
+    if delta.content:
+        print(delta.content, end="", flush=True)
 ```
 
-Or call it with plain HTTP / `curl`:
-
-```bash
-curl http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model": "deepseek-chat", "messages": [{"role": "user", "content": "Hello!"}]}'
-```
-
-**Endpoints**
-
-| Method | Path | Description |
-| --- | --- | --- |
-| `POST` | `/v1/chat/completions` | Chat (supports `"stream": true`, plus optional `"conversation_id"`, `"thinking"`, `"search"`) |
-| `GET`  | `/v1/models` | Lists the available models |
-| `GET`  | `/healthz` | Health check (rate-limit exempt) |
-
-> Change the address with env vars: `HOST=0.0.0.0 PORT=8080 python app.py`, or run `uvicorn server.api:app --host 0.0.0.0 --port 8080`.
-
-👉 More: [examples/04_server_http.py](examples/04_server_http.py), [examples/05_server_stream.py](examples/05_server_stream.py), [examples/06_server_openai_sdk.py](examples/06_server_openai_sdk.py)
-
----
-
-## Command line
-
-```bash
-python -m deepseek.auth          # sign in and save the session
-```
-
----
-
-## Human-check & proof-of-work (automatic)
-
-DeepSeek's chat sits behind two gates, both handled for you:
-
-- **AWS WAF human-check:** access needs a signed-in browser session that has
-  cleared the "verify you're human" check. `python -m deepseek.auth` opens a real
-  browser so you can sign in and solve it once; the resulting token + cookies are
-  cached under `session/` and reused on every request.
-- **Proof-of-work:** every completion is gated by a PoW challenge. The bridge
-  solves it by running DeepSeek's own `sha3_wasm_bg.wasm` module — the same one
-  the browser loads — inside a `wasmtime` sandbox, so there's nothing to do on
-  your end.
-
-A cached session is reused for ~6 hours and refreshed headlessly from your saved
-Chrome profile when possible; only a full expiry sends you back to the browser.
-
----
-
-## Models, DeepThink & web search
-
-The `model` name selects **which model** answers. DeepThink and web search are
-**not** models — they're orthogonal toggles you pass per request.
-
-| Model | DeepSeek mode | Notes |
-| --- | --- | --- |
-| `deepseek-chat` | Instant | Fast default model |
-| `deepseek-expert` | Expert | Stronger, slower |
-
-Pass `thinking: true` (DeepThink reasoning) and/or `search: true` (web search) in
-the request body — or via the OpenAI SDK's `extra_body`:
+### Direct Python Library
 
 ```python
-resp = client.chat.completions.create(
-    model="deepseek-expert",
-    messages=[{"role": "user", "content": "What changed in the news today?"}],
-    extra_body={"thinking": True, "search": True},
-)
+from deepseek.client import DeepSeekClient
+from deepseek.auth import get_session
+
+client = DeepSeekClient(get_session(allow_interactive=False))
+
+# Simple multi-turn chat
+reply = client.chat("Remember the number 42.")
+print(reply.text)
+
+follow_up = client.chat("What number did I tell you to remember?", conversation_id=reply.conversation_id)
+print(follow_up.text)
 ```
 
-`conversation_id`, `thinking`, and `search` are non-OpenAI extras. A thread's
-model is fixed at creation, so `model` can't be combined with `conversation_id`
-on resume. Unknown model names return a `404` (no silent fallback). See
-[server/config.py](server/config.py).
+---
+
+## Multimodal Vision Support
+
+The bridge includes an autonomous image pipeline that allows DeepSeek models to analyze image pixels directly:
+
+1. **Local Files**: Detects local file paths matching common formats (`.jpg`, `.jpeg`, `.png`, `.webp`, `.gif`, `.bmp`).
+   - Allowed directories: `/storage/emulated/0`, `/data/data/com.termux/files`, `/sdcard`, user home directory, and current working directory.
+   - Configurable via `MULTIMODAL_ALLOWED_ROOTS` in `.env`.
+2. **Data URIs**: Ingests base64-encoded image payloads (`data:image/jpeg;base64,...`).
+3. **Remote URLs**: Downloads and validates external images with SSRF protection against private IP spaces (RFC 1918, loopback, link-local).
+4. **Upstream Upload**: Automatically negotiates the DeepSeek Web upload protocol (`/api/v0/file/upload_file`) with dedicated PoW solving, polls processing status, and caches uploaded SHA-256 hashes to prevent redundant uploads.
+5. **Session Continuity**: Images can be attached on any turn of an ongoing conversation without destroying session continuity.
 
 ---
 
-## Concurrency
+## Session Management and Upstream Conversation Reuse
 
-The server bridges a **single** signed-in DeepSeek account behind one shared
-client. The PoW solver's `wasmtime` store isn't reentrant, so upstream calls are
-**serialized**: parallel HTTP requests queue behind a lock and run one at a time
-(see [server/api.py](server/api.py)). This is intentional — throughput is
-sequential, not parallel. Keep concurrent in-flight requests low, and please
-don't hammer your account.
+The bridge maps external client sessions to native DeepSeek conversations:
+
+- **1-to-1 Mapping**: Each OpenCode session ID maintains exactly one upstream conversation on `chat.deepseek.com`.
+- **True Upstream Threading**: Captures `response_message_id` from SSE frames and correctly chains messages using `parent_message_id`.
+- **Per-Session Concurrency Lock**: Prevents race conditions when parallel requests arrive for the same session.
+- **Stale Session Recovery**: If a user deletes an active conversation in the DeepSeek Web interface, the bridge detects the invalid upstream session, invalidates the local mapping, and transparently initializes a replacement thread with full history replay.
 
 ---
 
-## Rate limiting
+## Configuration Reference
 
-On top of serialization, the bridge enforces a self-imposed rate limit with a
-dependency-free sliding-window limiter ([server/ratelimit.py](server/ratelimit.py)):
-it caps accepted requests **per client IP** and returns a standard `429` +
-`Retry-After` when you exceed it. `/healthz` is exempt.
+Settings can be specified in `.env` (copy from `.env.example`):
 
-| Env var | Default | Meaning |
-| --- | --- | --- |
-| `RATE_LIMIT_PER_MINUTE` | `30` | Requests/minute accepted per client IP |
+| Variable | Default | Description |
+|---|---|---|
+| `HOST` | `127.0.0.1` | Network interface to bind the API server. |
+| `PORT` | `8000` | Port for the local API server. |
+| `RATE_LIMIT_PER_MINUTE` | `120` | Maximum requests per minute allowed per client IP. |
+| `SERVER_INTERACTIVE_LOGIN` | `true` | If true, launches a browser when authentication is missing. |
+| `DEEPSEEK_PROFILE_DIR` | `session/profile` | Optional path to a persistent Chrome user data profile. |
+| `MULTIMODAL_ALLOWED_ROOTS` | None | Colon/semicolon-separated list of additional paths permitted for local image access. |
 
-```bash
-RATE_LIMIT_PER_MINUTE=60 python app.py   # raise it
+---
+
+## Project Layout
+
+```
+deepseek-local-bridge/
+├── app.py                      # Server launcher script
+├── start.sh                    # Linux/Termux background daemon starter
+├── status.sh                   # Server and session status inspector
+├── stop.sh                     # Daemon stop script
+├── network-test.sh             # Diagnostic script for connectivity & DNS
+├── requirements.txt            # Python dependencies
+├── .env.example                # Example environment configuration
+├── deepseek/
+│   ├── auth.py                 # Desktop Playwright authentication module
+│   ├── auth_android.py         # Android / Termux ADB CDP authentication module
+│   ├── client.py               # Pure-HTTP DeepSeek chat client & PoW manager
+│   ├── multimodal.py           # Image ingestion, SSRF validation & upload pipeline
+│   ├── pow.py                  # WebAssembly PoW challenge solver
+│   └── sse.py                  # SSE streaming parser (THINK vs RESPONSE)
+├── server/
+│   ├── api.py                  # FastAPI OpenAI-compatible routing (/v1/chat/completions)
+│   ├── config.py               # Configuration parser & model mapping
+│   ├── openai_format.py        # OpenAI request/response formatting
+│   ├── ratelimit.py            # Token bucket rate limiting middleware
+│   ├── schemas.py              # Pydantic schemas for OpenAI API validation
+│   ├── sessions.py             # Persistent session mapping & concurrency locks
+│   ├── title_generator.py      # Local high-performance title generator
+│   └── tools_bridge.py         # Structured tool calling & nonce tag parser
+└── tools/
+    └── adb_autoconnect.py      # mDNS auto-discovery for Android Wireless Debugging
 ```
 
-**On the client side, use exponential backoff.** Transient `429`s clear if you
-retry with growing delays (e.g. 1s, 2s, 4s). The official `openai` SDK does this
-automatically and honours `Retry-After`; with plain HTTP, add a few retries
-yourself.
+---
+
+## Security Considerations
+
+- **Credential Isolation**: Bearer tokens and cookies are stored only on the local machine in `session/session.json`. They are never committed, logged, or exposed across the network.
+- **Localhost Binding**: By default, the server binds exclusively to `127.0.0.1`. Do not bind to public interfaces without adding authentication and reverse-proxy TLS termination.
+- **SSRF Hardening**: The multimodal pipeline resolves hostnames via DNS and blocks requests targeting internal IP ranges (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `127.0.0.0/8`, `169.254.0.0/16`).
+- **Filesystem Traversal Protection**: Local image access is restricted to verified path roots; attempts to read system directories (e.g. `/etc`, `/proc`) raise `PermissionError`.
 
 ---
 
-## Project layout
+## Troubleshooting
 
-| Path | What it does |
-| --- | --- |
-| [deepseek/](deepseek/) | The core library: `DeepSeekClient`, auth/browser sign-in ([auth.py](deepseek/auth.py)), the HTTP driver ([client.py](deepseek/client.py)), and the PoW solver ([pow.py](deepseek/pow.py)) |
-| [server/](server/) | The FastAPI OpenAI-compatible server |
-| [examples/](examples/) | Runnable examples for every feature ([examples/README.md](examples/README.md)) |
-| [app.py](app.py) | Starts the server |
+### Server Returns 503 `login_required`
+- Your captured DeepSeek session has expired or was revoked.
+- Re-run authentication:
+  - Desktop: `python -m deepseek.auth`
+  - Android/Termux: `python -m deepseek.auth_android`
+
+### DNS Resolution Failures on Android
+- If `network-test.sh` shows DNS resolution failure for `chat.deepseek.com`, verify that Android Private DNS is not blocking the hostname, or test toggling Wi-Fi / mobile data.
+
+### Tool Call Parse Errors
+- If the model emits unrecognized tool formatting, verify that the calling client provides schemas adhering to standard OpenAI tool definition formats. The bridge automatically translates between `<tool>`, DSML, and JSON schemas.
 
 ---
 
-## Notes & limitations
+## Known Limitations
 
-- **Sign in once, then reuse.** The cached session refreshes automatically; you only re-sign-in if it fully expires.
-- **Be reasonable.** Please use it in moderation, and don't spam or hammer it with automated bulk requests.
-- **No real token counts.** `usage` in responses is a rough ~4-chars/token estimate.
-- **Most OpenAI params are accepted but ignored** (`temperature`, `top_p`, `max_tokens`); only `model`, `messages`, `stream`, `conversation_id`, `thinking`, and `search` do anything.
-- **Vision is deferred.** It needs image-upload plumbing that isn't built yet.
-- **Your session is private.** Everything in `session/` (cookies + token) stays on your machine and is git-ignored.
+- **Immutable Model per Thread**: DeepSeek Web threads fix their model type (`default` vs `expert`) at creation. Switching models within the same OpenCode session triggers the creation of a new upstream conversation.
+- **Web Protocol Dependency**: Relies on internal endpoints of `chat.deepseek.com`. Significant changes to upstream Cloudflare or WebAssembly challenges may require library updates.
+
+---
 
 ## License
 
-Released under the [MIT License](LICENSE). As this is an unofficial project, you remain responsible for complying with DeepSeek's terms of service.
-
----
-
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.

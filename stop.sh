@@ -1,4 +1,4 @@
-#!/data/data/com.termux/files/usr/bin/bash
+#!/bin/sh
 # Stop the DeepSeek local API server and release the wake-lock.
 set -u
 DIR="$(cd "$(dirname "$0")" && pwd)"
