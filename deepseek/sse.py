@@ -123,6 +123,14 @@ def parse_sse_events(lines, meta: Optional[dict] = None) -> Iterator[tuple]:
         p = obj.get("p")
         o = obj.get("o")
 
+        # Capture hint / error frames (e.g. context_length_exceeded)
+        if meta is not None:
+            if obj.get("type") == "error" or obj.get("finish_reason") == "context_length_exceeded":
+                meta["error"] = obj.get("finish_reason") or "error"
+                meta["error_msg"] = obj.get("content") or "Context length exceeded or error"
+            elif isinstance(obj.get("finish_reason"), str):
+                meta["finish_reason"] = obj["finish_reason"]
+
         # Capture response_message_id from top-level framing if present
         if meta is not None and isinstance(obj.get("response_message_id"), int):
             meta["message_id"] = obj["response_message_id"]

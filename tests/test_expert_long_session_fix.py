@@ -48,5 +48,26 @@ class TestExpertLongSessionFix(unittest.TestCase):
         self.assertEqual(events[0][0], "error")
         self.assertIn("without emitting any content", events[0][1])
 
+    def test_sse_context_length_exceeded_frame(self):
+        raw_lines = [
+            'event: ready',
+            'data: {"request_message_id":1,"response_message_id":2,"model_type":"expert"}',
+            'event: hint',
+            'data: {"type":"error","content":"Length limit reached. Please start a new chat.","clear_response":true,"finish_reason":"context_length_exceeded"}',
+            'event: close',
+            'data: {"click_behavior":"none","auto_resume":false}',
+        ]
+        meta = {}
+        events = list(parse_sse_events(raw_lines, meta))
+        self.assertEqual(meta.get("error"), "context_length_exceeded")
+        self.assertIn("Length limit reached", meta.get("error_msg", ""))
+
+    def test_invalid_conversation_markers_context_length(self):
+        from server.api import _looks_like_invalid_conversation
+        self.assertTrue(_looks_like_invalid_conversation("Context length limit reached on upstream session"))
+        self.assertTrue(_looks_like_invalid_conversation("Length limit reached. Please start a new chat."))
+        self.assertTrue(_looks_like_invalid_conversation("finish_reason: context_length_exceeded"))
+        self.assertFalse(_looks_like_invalid_conversation("Connection reset by peer"))
+
 if __name__ == "__main__":
     unittest.main()

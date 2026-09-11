@@ -290,7 +290,8 @@ def _run_turn(client, prompt, conversation_id, model_type, thinking, search,
 _INVALID_CONV_MARKERS = (
     "chat session not exist", "chat_session", "not found", "invalid",
     "expired", "permission", "concurrent", "invalid message id",
-    "biz_code=1", "biz_code=26",
+    "biz_code=1", "biz_code=26", "context_length_exceeded",
+    "length limit reached", "please start a new chat", "context length limit",
 )
 
 
@@ -298,7 +299,8 @@ def _looks_like_invalid_conversation(msg: str) -> bool:
     low = msg.lower()
     return any(m in low for m in _INVALID_CONV_MARKERS) and (
         "not exist" in low or "invalid" in low or "not found" in low
-        or "expired" in low
+        or "expired" in low or "length limit" in low or "new chat" in low
+        or "context_length" in low or "context length" in low
     )
 
 

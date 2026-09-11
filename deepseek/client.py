@@ -358,6 +358,14 @@ class _Stream:
                         if kind in ("content", "reasoning"):
                             yielded_any = True
                         yield ev
+
+                # Check if upstream explicitly signaled context length exceeded
+                if meta.get("error") == "context_length_exceeded" or "length limit reached" in str(meta.get("error_msg", "")).lower():
+                    print(f"[deepseek] context length exceeded in session {self._session_id}: {meta.get('error_msg')}", flush=True)
+                    raise ConversationDesyncError(
+                        f"Context length limit reached on upstream session {self._session_id} ({meta.get('error_msg')})."
+                    )
+
                 if yielded_any:
                     break
                 # If the stream ended without emitting ANY content or reasoning,
