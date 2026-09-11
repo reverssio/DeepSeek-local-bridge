@@ -44,7 +44,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 from deepseek.auth import LoginRequired
-from deepseek.client import DeepSeekClient
+from deepseek.client import ConversationDesyncError, DeepSeekClient
 
 from .config import (
     MODEL_MAP,
@@ -550,6 +550,13 @@ async def chat_completions(request: Request, req: ChatCompletionRequest):
                     reasoning="".join(reasoning),
                     tool_calls=tool_calls or None,
                 )
+            except ConversationDesyncError:
+                # Branch hell: the conversation's message-id chain is
+                # irreparably broken.  Invalidate and signal the caller
+                # to retry with a fresh conversation + full history.
+                if conversation_id:
+                    cmap.invalidate(conversation_id)
+                return None
             except RuntimeError as e:
                 msg = str(e)
                 if _looks_like_invalid_conversation(msg) and conversation_id:
@@ -630,8 +637,16 @@ async def chat_completions(request: Request, req: ChatCompletionRequest):
         acc_reasoning: list[str] = []
         tool_calls: list[ToolCall] = []
         finish = "stop"
+
+        # The turn source may be replaced mid-flight if branch-hell
+        # recovery kicks in (see ConversationDesyncError below).
+        use_prompt = prompt
+        use_cid = conversation_id
+        use_model_type = model_type
+        use_prompt_mode = prompt_mode
+
         try:
-            turn = serve(prompt, conversation_id, model_type, prompt_mode)
+            turn = serve(use_prompt, use_cid, use_model_type, use_prompt_mode)
             for kind, v in turn.events():
                 if kind == "content":
                     acc_content.append(v)
@@ -650,6 +665,39 @@ async def chat_completions(request: Request, req: ChatCompletionRequest):
             finish = turn.finish_reason
             yield ("done", {"cid": cid, "content": "".join(acc_content),
                             "tool_calls": tool_calls})
+        except ConversationDesyncError as e:
+            # Branch hell: the conversation's message-id chain is
+            # irreparably broken.  Invalidate the mapping and
+            # transparently retry with a fresh conversation + full
+            # history.  ConversationDesyncError is raised before any
+            # content is yielded, so the client sees only the recovery.
+            print(f"[sessions] branch-hell recovery during stream: {e}", flush=True)
+            if use_cid:
+                cmap.invalidate(use_cid)
+            fresh_prompt = build_first_prompt(req.messages, tools)
+            try:
+                turn2 = serve(fresh_prompt, None,
+                              resolve_model_type(req.model), "fresh")
+                for kind, v in turn2.events():
+                    if kind == "content":
+                        acc_content.append(v)
+                        yield ("content", v)
+                    elif kind == "reasoning":
+                        acc_reasoning.append(v)
+                        yield ("reasoning", v)
+                    elif kind == "tool_calls":
+                        tool_calls.extend(v)
+                        finish = "tool_calls"
+                        yield ("tool_calls", v)
+                    elif kind == "error":
+                        yield ("error", v)
+                        return
+                cid = turn2.conversation_id
+                finish = turn2.finish_reason
+                yield ("done", {"cid": cid, "content": "".join(acc_content),
+                                "tool_calls": tool_calls})
+            except Exception as e2:
+                yield ("done", {"error": str(e2)})
         except Exception as e:
             msg = str(e)
             if _looks_like_invalid_conversation(msg) and conversation_id:

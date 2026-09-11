@@ -35,6 +35,19 @@ from .sse import parse_sse_events
 
 _pow_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="deepseek-pow")
 
+
+class ConversationDesyncError(RuntimeError):
+    """Raised when a conversation's message-ID chain is irreparably broken.
+
+    This happens when the bridge's stored parent_message_id points to an
+    orphaned branch in DeepSeek's conversation tree.  Previous resync-retry
+    cycles appended messages from the trunk head, creating side branches
+    that DeepSeek never promotes to the trunk — so every subsequent turn
+    is rejected, resynced to the same stale head, and branches again
+    ("branch hell").  The only recovery is a fresh conversation with full
+    history replay.
+    """
+
 BASE = "https://chat.deepseek.com"
 COMPLETION_PATH = "/api/v0/chat/completion"
 
@@ -318,18 +331,36 @@ class _Stream:
                         biz_code = err_data.get("data", {}).get("biz_code") if isinstance(err_data.get("data"), dict) else None
                         biz_msg = err_data.get("data", {}).get("biz_msg") or err_data.get("msg") or str(err_data)
                         if (biz_code == 26 or "invalid message id" in str(biz_msg).lower()) and attempt < 2 and not yielded_any:
-                            print(f"[deepseek] parent_message_id {body.get('parent_message_id')} desynchronized (biz_code 26). Resynchronizing with session head...", flush=True)
+                            our_mid = body.get("parent_message_id")
+                            print(f"[deepseek] parent_message_id {our_mid} rejected (biz_code 26). Querying upstream head...", flush=True)
                             real_mid = self._client.get_session_current_message_id(self._session_id)
-                            if real_mid is not None and real_mid != body.get("parent_message_id"):
-                                print(f"[deepseek] resynchronized parent_message_id: {body.get('parent_message_id')} -> {real_mid}", flush=True)
+                            if real_mid is not None and real_mid > (our_mid or 0):
+                                # Upstream head is AHEAD of ours: the bridge simply fell
+                                # behind (e.g. a prior response's message_id wasn't captured,
+                                # or manual messages were added on chat.deepseek.com).
+                                # Resyncing FORWARD is safe — we join the trunk.
+                                print(f"[deepseek] resync FORWARD: {our_mid} -> {real_mid} (bridge was behind)", flush=True)
                                 body["parent_message_id"] = real_mid
                                 self._parent_id = real_mid
                                 continue
-                            elif real_mid is None and body.get("parent_message_id") is not None:
-                                print(f"[deepseek] resynchronized parent_message_id {body.get('parent_message_id')} -> None (session head fallback)", flush=True)
-                                body["parent_message_id"] = None
-                                self._parent_id = None
-                                continue
+                            else:
+                                # Upstream head is BEHIND or EQUAL to ours, or unavailable.
+                                # This is "branch hell": a prior resync-retry created a
+                                # branch that DeepSeek never promoted to the trunk.  Every
+                                # subsequent turn will be rejected, resynced to the same
+                                # stale head, and branch again forever.  The only recovery
+                                # is a fresh conversation with full history replay.
+                                direction = (f"upstream head {real_mid} <= ours {our_mid}"
+                                             if real_mid is not None
+                                             else f"upstream head unavailable, ours {our_mid}")
+                                print(f"[deepseek] BRANCH HELL detected: {direction}. "
+                                      f"Conversation {self._session_id} is irreparably "
+                                      f"desynchronized — signalling fresh-conversation recovery.", flush=True)
+                                raise ConversationDesyncError(
+                                    f"Conversation {self._session_id} is in branch hell "
+                                    f"({direction}). A fresh conversation with full "
+                                    f"history replay is required."
+                                )
                         raise RuntimeError(f"DeepSeek upstream business error: {biz_msg} (biz_code={biz_code})")
 
                     for ev in parse_sse_events(resp.iter_lines(), meta):
