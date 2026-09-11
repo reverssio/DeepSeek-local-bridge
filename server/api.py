@@ -277,7 +277,8 @@ def _run_turn(client, prompt, conversation_id, model_type, thinking, search,
 
 _INVALID_CONV_MARKERS = (
     "chat session not exist", "chat_session", "not found", "invalid",
-    "expired", "permission", "concurrent",
+    "expired", "permission", "concurrent", "invalid message id",
+    "biz_code=1", "biz_code=26",
 )
 
 
@@ -650,6 +651,10 @@ async def chat_completions(request: Request, req: ChatCompletionRequest):
             yield ("done", {"cid": cid, "content": "".join(acc_content),
                             "tool_calls": tool_calls})
         except Exception as e:
+            msg = str(e)
+            if _looks_like_invalid_conversation(msg) and conversation_id:
+                print(f"[sessions] invalid conversation detected during stream: {msg} — invalidating map", flush=True)
+                cmap.invalidate(conversation_id)
             yield ("done", {"error": str(e)})
 
     class _EventAdapter:

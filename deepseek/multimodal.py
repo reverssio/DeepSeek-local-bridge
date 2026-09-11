@@ -279,6 +279,8 @@ def extract_images_from_messages(messages: list) -> List[ImageAsset]:
                                 assets.append(parse_data_uri(url))
                             elif url.startswith("http://") or url.startswith("https://"):
                                 assets.append(fetch_remote_image(url))
+                            elif url.startswith("file://"):
+                                assets.append(validate_and_load_local_image(url[len("file://"):]))
                             else:
                                 # treat as local file path
                                 assets.append(validate_and_load_local_image(url))

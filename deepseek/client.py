@@ -150,6 +150,24 @@ class DeepSeekClient:
         print(f"[deepseek] created chat_session {sid}", flush=True)
         return sid
 
+    def get_session_current_message_id(self, chat_session_id: str) -> Optional[int]:
+        """Fetch the current head message ID of a chat session from DeepSeek Web."""
+        try:
+            r = self._http.get(f"/api/v0/chat/history_messages?chat_session_id={chat_session_id}")
+            if r.status_code == 200:
+                data = r.json()
+                if data.get("code") == 0:
+                    biz = data.get("data", {}).get("biz_data", {})
+                    cur_mid = biz.get("chat_session", {}).get("current_message_id")
+                    if isinstance(cur_mid, int):
+                        return cur_mid
+                    msgs = biz.get("chat_messages", [])
+                    if msgs and isinstance(msgs[-1].get("message_id"), int):
+                        return msgs[-1].get("message_id")
+        except Exception as e:
+            print(f"[deepseek] failed to get current_message_id for {chat_session_id}: {e}", flush=True)
+        return None
+
     def refresh_auth(self) -> bool:
         """Attempt single-flight reload or headless refresh of session token."""
         with self._auth_lock:
@@ -285,7 +303,7 @@ class _Stream:
         # requests / right at request start" case. If bytes were already
         # emitted, retrying would duplicate output, so we raise instead.
         yielded_any = False
-        for attempt in range(2):
+        for attempt in range(3):
             # PoW challenges are short-lived, so solve right before the request.
             headers = {"x-ds-pow-response": self._client._pow_header()}
             try:
@@ -293,6 +311,27 @@ class _Stream:
                     "POST", COMPLETION_PATH, json=body, headers=headers
                 ) as resp:
                     resp.raise_for_status()
+                    ctype = resp.headers.get("content-type", "")
+                    if ctype.startswith("application/json"):
+                        # DeepSeek returned an application/json business error payload instead of an SSE stream
+                        err_data = json.loads(resp.read().decode("utf-8", errors="replace"))
+                        biz_code = err_data.get("data", {}).get("biz_code") if isinstance(err_data.get("data"), dict) else None
+                        biz_msg = err_data.get("data", {}).get("biz_msg") or err_data.get("msg") or str(err_data)
+                        if (biz_code == 26 or "invalid message id" in str(biz_msg).lower()) and attempt < 2 and not yielded_any:
+                            print(f"[deepseek] parent_message_id {body.get('parent_message_id')} desynchronized (biz_code 26). Resynchronizing with session head...", flush=True)
+                            real_mid = self._client.get_session_current_message_id(self._session_id)
+                            if real_mid is not None and real_mid != body.get("parent_message_id"):
+                                print(f"[deepseek] resynchronized parent_message_id: {body.get('parent_message_id')} -> {real_mid}", flush=True)
+                                body["parent_message_id"] = real_mid
+                                self._parent_id = real_mid
+                                continue
+                            elif real_mid is None and body.get("parent_message_id") is not None:
+                                print(f"[deepseek] resynchronized parent_message_id {body.get('parent_message_id')} -> None (session head fallback)", flush=True)
+                                body["parent_message_id"] = None
+                                self._parent_id = None
+                                continue
+                        raise RuntimeError(f"DeepSeek upstream business error: {biz_msg} (biz_code={biz_code})")
+
                     for ev in parse_sse_events(resp.iter_lines(), meta):
                         kind = ev[0]
                         if kind in ("content", "reasoning"):
