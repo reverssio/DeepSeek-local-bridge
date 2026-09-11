@@ -334,32 +334,22 @@ class _Stream:
                             our_mid = body.get("parent_message_id")
                             print(f"[deepseek] parent_message_id {our_mid} rejected (biz_code 26). Querying upstream head...", flush=True)
                             real_mid = self._client.get_session_current_message_id(self._session_id)
-                            if real_mid is not None and real_mid > (our_mid or 0):
-                                # Upstream head is AHEAD of ours: the bridge simply fell
-                                # behind (e.g. a prior response's message_id wasn't captured,
-                                # or manual messages were added on chat.deepseek.com).
-                                # Resyncing FORWARD is safe — we join the trunk.
-                                print(f"[deepseek] resync FORWARD: {our_mid} -> {real_mid} (bridge was behind)", flush=True)
+                            if real_mid is not None and real_mid != our_mid:
+                                # Resynchronize to the true upstream head message ID.
+                                # This handles both forward drift (e.g. out-of-band turns or
+                                # uncaptured SSE frames) and backward correction (when our
+                                # stored parent_message_id was a speculative ghost ID from an
+                                # aborted or empty stream that DeepSeek never committed).
+                                print(f"[deepseek] resynchronized parent_message_id: {our_mid} -> {real_mid} (session head)", flush=True)
                                 body["parent_message_id"] = real_mid
                                 self._parent_id = real_mid
                                 continue
                             else:
-                                # Upstream head is BEHIND or EQUAL to ours, or unavailable.
-                                # This is "branch hell": a prior resync-retry created a
-                                # branch that DeepSeek never promoted to the trunk.  Every
-                                # subsequent turn will be rejected, resynced to the same
-                                # stale head, and branch again forever.  The only recovery
-                                # is a fresh conversation with full history replay.
-                                direction = (f"upstream head {real_mid} <= ours {our_mid}"
-                                             if real_mid is not None
-                                             else f"upstream head unavailable, ours {our_mid}")
-                                print(f"[deepseek] BRANCH HELL detected: {direction}. "
-                                      f"Conversation {self._session_id} is irreparably "
-                                      f"desynchronized — signalling fresh-conversation recovery.", flush=True)
+                                # Even the upstream head was rejected or unavailable.
+                                # Only in this truly unrecoverable case do we declare desync.
+                                print(f"[deepseek] conversation {self._session_id} head {real_mid} is invalid — signalling recovery.", flush=True)
                                 raise ConversationDesyncError(
-                                    f"Conversation {self._session_id} is in branch hell "
-                                    f"({direction}). A fresh conversation with full "
-                                    f"history replay is required."
+                                    f"Conversation {self._session_id} head {real_mid} was rejected by upstream (biz_code={biz_code})."
                                 )
                         raise RuntimeError(f"DeepSeek upstream business error: {biz_msg} (biz_code={biz_code})")
 
@@ -368,7 +358,12 @@ class _Stream:
                         if kind in ("content", "reasoning"):
                             yielded_any = True
                         yield ev
-                break
+                if yielded_any:
+                    break
+                # If the stream ended without emitting ANY content or reasoning,
+                # DeepSeek did not generate a response. Do not break or commit message_id;
+                # retry on next attempt if attempts remain.
+                print(f"[deepseek] upstream stream completed with zero tokens on attempt {attempt}, retrying...", flush=True)
             except (httpx.TransportError, httpx.HTTPStatusError) as e:
                 if attempt == 0 and not yielded_any:
                     if isinstance(e, httpx.HTTPStatusError) and e.response.status_code in (401, 403):
@@ -381,6 +376,12 @@ class _Stream:
                         "already delivered; ask again to regenerate."
                     ) from e
                 raise
+
+        if not yielded_any:
+            raise RuntimeError(
+                f"DeepSeek upstream completion finished with zero tokens after {attempt + 1} attempts."
+            )
+
         if meta.get("message_id") is not None:
             self._message_id = meta["message_id"]
 

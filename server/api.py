@@ -261,6 +261,18 @@ class _TurnStream:
         else:
             if len(text) > self._emitted:
                 yield ("content", text[self._emitted:])
+
+        # Guard against zero-event empty completions:
+        # If the turn produced no text and no tool calls, it must not be reported
+        # as a successful empty stop, because OpenCode records empty assistant messages
+        # and stops generating. Raise an error to trigger retry/recovery.
+        if not text and not self._pending_calls and not self._saw_markup:
+            yield (
+                "error",
+                "DeepSeek upstream completed without emitting any content or tool calls. Retrying...",
+            )
+            return
+
         self.conversation_id = self._upstream.conversation_id
 
 

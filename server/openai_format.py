@@ -94,6 +94,22 @@ def messages_to_prompt(messages: List[ChatMessage]) -> str:
     return "\n\n".join(lines)
 
 
+def _is_meaningful_assistant(m: ChatMessage) -> bool:
+    """True if an assistant message contains real text or tool calls."""
+    if m.role != "assistant":
+        return False
+    if m.tool_calls:
+        return True
+    c = m.content
+    if isinstance(c, str) and c.strip():
+        return True
+    if isinstance(c, list) and any(
+        isinstance(p, dict) and p.get("text", "").strip() for p in c
+    ):
+        return True
+    return False
+
+
 def new_turn_messages(messages: List[ChatMessage]) -> List[ChatMessage]:
     """The trailing messages that are NEW since the mapped conversation turn.
 
@@ -101,16 +117,18 @@ def new_turn_messages(messages: List[ChatMessage]) -> List[ChatMessage]:
     already holds everything up to and including the assistant reply we
     returned. The new information is: tool-result messages and/or the new
     user message (everything after the last assistant echo). We detect it by
-    walking back to the last assistant message.
+    walking back to the last meaningful assistant message (skipping empty/stopped
+    phantom assistant messages that carry neither content nor tool calls).
     """
     last_assistant = -1
     for i in range(len(messages) - 1, -1, -1):
-        if messages[i].role == "assistant":
+        if _is_meaningful_assistant(messages[i]):
             last_assistant = i
             break
     if last_assistant < 0:
-        return messages
-    return messages[last_assistant + 1:]
+        return [m for m in messages if not (m.role == "assistant" and not _is_meaningful_assistant(m))]
+    trailing = messages[last_assistant + 1:]
+    return [m for m in trailing if not (m.role == "assistant" and not _is_meaningful_assistant(m))]
 
 
 def build_first_prompt(messages: List[ChatMessage], tools: list) -> str:
