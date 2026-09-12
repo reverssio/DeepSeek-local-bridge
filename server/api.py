@@ -246,18 +246,31 @@ class _TurnStream:
                 # calls were already emitted progressively; nothing more to do
                 self.finish_reason = "tool_calls"
             else:
-                # Markup was detected but NOTHING parsed as a tool call —
-                # the model attempted a tool call in a dialect we couldn't
-                # structure. Emitting the (stripped) text as a normal answer
-                # would let the conversation claim an action that never ran.
-                # Instead surface a hard error so the agent can retry.
-                yield (
-                    "error",
-                    "The model attempted a tool call in an unrecognized "
-                    "format (raw markup suppressed). Ask it to retry using "
-                    "the exact <tool>{\"name\": ..., \"arguments\": {...}}</tool> "
-                    "JSON format.",
+                # Markup was detected mid-stream but no tool call could be structured.
+                # Check whether the text contains an actual unescaped tool invocation attempt
+                # vs benign text mentioning markup keywords (e.g. documentation, code blocks,
+                # backticks, or explanation of tools).
+                import re as _re
+                has_active_call_block = bool(
+                    _re.search(r"<[｜|]{1,2}\s*DSML\s*[｜|]{1,2}\s*invoke\b", text)
+                    or _re.search(r"<tool\b[^>]*>[\s\S]*?</tool>", text)
+                    or _re.search(r"<invoke\b[^>]*>[\s\S]*?</invoke>", text)
                 )
+                if has_active_call_block:
+                    # Genuine tool call attempt in a malformed dialect: surface error so agent retries.
+                    yield (
+                        "error",
+                        "The model attempted a tool call in an unrecognized "
+                        "format (raw markup suppressed). Ask it to retry using "
+                        "the exact <tool>{\"name\": ..., \"arguments\": {...}}</tool> "
+                        "JSON format.",
+                    )
+                else:
+                    # Benign text that happened to contain markup keywords (e.g. markdown report
+                    # mentioning `DSML` or `<tool>` in backticks or code blocks).
+                    # Emit the remaining text as normal content so valid responses are not suppressed.
+                    if len(text) > self._emitted:
+                        yield ("content", text[self._emitted:])
         else:
             if len(text) > self._emitted:
                 yield ("content", text[self._emitted:])

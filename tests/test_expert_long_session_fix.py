@@ -69,5 +69,48 @@ class TestExpertLongSessionFix(unittest.TestCase):
         self.assertTrue(_looks_like_invalid_conversation("finish_reason: context_length_exceeded"))
         self.assertFalse(_looks_like_invalid_conversation("Connection reset by peer"))
 
+    def test_dsml_write_with_nested_invoke_text(self):
+        from server.tools_bridge import parse_tool_calls
+
+        sample_resp = '''I will write the document now.
+
+<｜｜DSML｜｜ calls>
+<｜｜DSML｜｜ invoke name="write">
+<｜｜DSML｜｜ parameter name="content" string="true"># Architecture
+Here is an explanation mentioning <invoke> tags inside text.
+</｜｜DSML｜｜ parameter>
+<｜｜DSML｜｜ parameter name="filePath" string="true">/path/to/doc.md</｜｜DSML｜｜ parameter>
+</｜｜DSML｜｜ invoke>
+</｜｜DSML｜｜ calls>'''
+
+        tools_def = [
+            {"type": "function", "function": {"name": "write", "parameters": {"type": "object", "properties": {"filePath": {"type": "string"}, "content": {"type": "string"}}, "required": ["filePath", "content"]}}}
+        ]
+
+        calls, clean = parse_tool_calls(sample_resp, tools_def)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "write")
+        self.assertEqual(calls[0].arguments.get("filePath"), "/path/to/doc.md")
+        self.assertIn("Here is an explanation", calls[0].arguments.get("content", ""))
+
+    def test_benign_text_with_tool_keywords_emitted_as_content(self):
+        from server.api import _TurnStream
+        import threading
+
+        sample_markdown = 'In `tools_bridge.py`, we match `<tool>` and `DSML` patterns.'
+
+        class MockUpstreamText:
+            conversation_id = "test:101"
+            def events(self):
+                yield ("content", sample_markdown)
+
+        ts = _TurnStream(MockUpstreamText(), ["bash", "read"], "deepseek-expert", threading.Lock())
+        events = list(ts.events())
+        self.assertEqual(ts.finish_reason, "stop")
+        content_events = [v for k, v in events if k == "content"]
+        self.assertTrue(len(content_events) > 0)
+        full_emitted = "".join(content_events)
+        self.assertEqual(full_emitted, sample_markdown)
+
 if __name__ == "__main__":
     unittest.main()

@@ -391,29 +391,46 @@ def extract_dsml_calls(
         return [], text
 
     invoke_start_pat = re.compile(
-        r'(?:</?[｜|]{1,2}\s*DSML\s*[｜|]{1,2}\s*invoke|<invoke)\s+(?:name|tool)=["\']?([^"\'\s>]+)["\']?[^>]*>',
+        r'(</?[｜|]{1,2}\s*DSML\s*[｜|]{1,2}\s*invoke\s+(?:name|tool)=["\']?([^"\'\s>]+)["\']?[^>]*>)',
         re.DOTALL,
     )
     invoke_end_pat = re.compile(
-        r'</?[｜|]{1,2}\s*DSML\s*[｜|]{1,2}\s*/?invoke\b[^>]*>|</?invoke\s*>',
+        r'(</[｜|]{1,2}\s*DSML\s*[｜|]{1,2}\s*invoke\s*>|<invoke\s*/>)',
         re.DOTALL,
     )
     param_tag_re = re.compile(
-        r'(?:</?[｜|]{1,2}\s*DSML\s*[｜|]{1,2}\s*parameter|<parameter)\b([^>]*?)(?:/>|>(.*?)(?:</[｜|]{1,2}\s*DSML\s*[｜|]{1,2}\s*/?parameter\b[^>]*>|</parameter\s*>))',
+        r'</?[｜|]{1,2}\s*DSML\s*[｜|]{1,2}\s*parameter\b([^>]*?)(?:/>|>(.*?)</[｜|]{1,2}\s*DSML\s*[｜|]{1,2}\s*parameter\s*>)',
+        re.DOTALL,
+    )
+
+    # Fallback pattern for generic <invoke> if DSML double-bar pattern matches nothing
+    generic_invoke_start = re.compile(
+        r'<invoke\s+(?:name|tool)=["\']?([^"\'\s>]+)["\']?[^>]*>',
+        re.DOTALL,
+    )
+    generic_invoke_end = re.compile(
+        r'</invoke\s*>',
+        re.DOTALL,
+    )
+    generic_param_re = re.compile(
+        r'<parameter\b([^>]*?)(?:/>|>(.*?)</parameter\s*>)',
         re.DOTALL,
     )
 
     calls: List[ToolCall] = []
     accepted_ranges: List[Tuple[int, int]] = []
 
+    # Try native DSML tags first (strict matching on DSML markers)
+    dsml_matched = False
     for im in invoke_start_pat.finditer(text):
-        raw_name = im.group(1).strip()
+        raw_name = im.group(2).strip()
         canon_name = _canonical(raw_name, known)
         if not canon_name:
             continue
         em = invoke_end_pat.search(text, im.end())
         if not em:
             continue
+        dsml_matched = True
         invoke_body = text[im.end():em.start()]
         args: dict = {}
         for pm in param_tag_re.finditer(invoke_body):
@@ -449,6 +466,38 @@ def extract_dsml_calls(
             accepted_ranges.append((im.start(), em.end()))
         else:
             logger.warning("DSML tool call rejected: %s", err)
+
+    if not dsml_matched and "<invoke" in text:
+        for im in generic_invoke_start.finditer(text):
+            raw_name = im.group(1).strip()
+            canon_name = _canonical(raw_name, known)
+            if not canon_name:
+                continue
+            em = generic_invoke_end.search(text, im.end())
+            if not em:
+                continue
+            invoke_body = text[im.end():em.start()]
+            args: dict = {}
+            for pm in generic_param_re.finditer(invoke_body):
+                attrs = pm.group(1)
+                inner = (pm.group(2) or "").strip()
+                name_m = re.search(r'name=["\']?([^"\'\s>]+)["\']?', attrs)
+                if not name_m:
+                    continue
+                pname = name_m.group(1).strip()
+                content_m = re.search(r'content=["\']([^"\']*)["\']', attrs)
+                val = content_m.group(1) if content_m else inner
+                args[pname] = val
+            if not args:
+                obj = parse_loose_json(invoke_body)
+                if isinstance(obj, dict):
+                    args = obj
+            valid, err, norm_args = validate_and_normalize_call(canon_name, args, tool_schemas)
+            if valid:
+                calls.append(ToolCall(canon_name, norm_args))
+                accepted_ranges.append((im.start(), em.end()))
+            else:
+                logger.warning("Generic invoke tool call rejected: %s", err)
 
     clean = strip_ranges(text, accepted_ranges)
     return calls, clean
